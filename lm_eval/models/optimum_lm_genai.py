@@ -92,8 +92,8 @@ class OpenVINOCausalLM(HFLM):
             eval_logger.info(f"Device: {self.openvino_device.upper()}")
             eval_logger.info(f"KV Cache: {'enabled' if self.kv_cache else 'disabled'}")
             
-            # Add config attribute for compatibility (can't add to LLMPipeline, so add to self)
-            self.config = self._create_model_config()
+            # Add config attribute for compatibility - store internally
+            self._config = self._create_model_config()
 
         except Exception as e:
             raise RuntimeError(
@@ -246,6 +246,11 @@ class OpenVINOCausalLM(HFLM):
                 # Delegate all other attributes/methods to the original model
                 return getattr(self._model, name)
         
-        return ModelWrapper(self._model, self.config)
+        return ModelWrapper(self._model, self._config)
+    
+    @property 
+    def config(self):
+        """Property to access model config."""
+        return self._config
 
 
