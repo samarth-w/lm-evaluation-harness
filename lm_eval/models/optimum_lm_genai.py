@@ -9,6 +9,7 @@ eval_logger = logging.getLogger(__name__)
 
 
 @register_model("openvino_genai")
+@register_model("openvino-causal")  # Keep both for compatibility
 class OpenVINOCausalLM(HFLM):
     """
     OpenVINO GenAI provides a simple interface to run generative AI models optimized for
