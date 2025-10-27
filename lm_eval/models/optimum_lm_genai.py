@@ -97,7 +97,7 @@ class OpenVINOCausalLM(HFLM):
                 eval_logger.info(f"OpenVINO Cache Directory: {self.cache_dir}")
             
             # Add config attribute for compatibility - store internally
-            self._config = self._create_model_config()
+            self._config = self._create_model_config(pretrained)
 
         except Exception as e:
             raise RuntimeError(
@@ -114,20 +114,47 @@ class OpenVINOCausalLM(HFLM):
             def __init__(self, ov_tokenizer):
                 self._tokenizer = ov_tokenizer
                 
-                # Try to get vocab size from OpenVINO GenAI tokenizer
+                # Try to get vocab_size from tokenizer - dynamic detection
+                self.vocab_size = self._detect_vocab_size(ov_tokenizer)
+            
+            def _detect_vocab_size(self, tokenizer):
+                """Dynamically detect vocabulary size from different model types."""
                 try:
-                    # Try different methods to get vocab size
-                    if hasattr(ov_tokenizer, 'get_vocab_size'):
-                        self.vocab_size = ov_tokenizer.get_vocab_size()
-                    elif hasattr(ov_tokenizer, 'vocab_size'):
-                        self.vocab_size = ov_tokenizer.vocab_size
-                    else:
-                        # For Gemma models, typical vocab size is around 256k
-                        self.vocab_size = 256000
-                        eval_logger.warning(f"Could not determine vocab size from tokenizer, using Gemma default: {self.vocab_size}")
+                    # Try direct vocab_size attribute
+                    if hasattr(tokenizer, 'vocab_size'):
+                        return tokenizer.vocab_size
+                    
+                    # Try get_vocab_size method
+                    if hasattr(tokenizer, 'get_vocab_size'):
+                        return tokenizer.get_vocab_size()
+                    
+                    # Try to get vocab and count
+                    if hasattr(tokenizer, 'get_vocab'):
+                        vocab = tokenizer.get_vocab()
+                        return len(vocab)
+                    
+                    # Try encoding a sample to estimate vocab size
+                    try:
+                        # Test with a range of tokens to find max token ID
+                        test_text = "The quick brown fox jumps over the lazy dog. 0123456789 !@#$%^&*()"
+                        tokens = tokenizer.encode(test_text)
+                        if tokens:
+                            max_token = max(tokens.input_ids if hasattr(tokens, 'input_ids') else tokens)
+                            # Estimate vocab size as max_token * 1.2 (with some buffer)
+                            estimated_size = int(max_token * 1.2)
+                            # Common vocab sizes - round to nearest
+                            common_sizes = [32000, 50257, 50400, 128000, 256000, 400000]
+                            return min(common_sizes, key=lambda x: abs(x - estimated_size))
+                    except:
+                        pass
+                    
+                    # Model-specific defaults based on common architectures
+                    eval_logger.warning("Could not detect vocab size, using intelligent defaults")
+                    return 50257  # GPT-2 style default, works for many models
+                    
                 except Exception as e:
-                    self.vocab_size = 256000  # Larger default for modern models
-                    eval_logger.warning(f"Error getting vocab size ({e}), using default: {self.vocab_size}")
+                    eval_logger.warning(f"Error detecting vocab size: {e}, using default")
+                    return 50257  # Safe default
                 
                 # Set token IDs with fallbacks
                 try:
@@ -222,28 +249,77 @@ class OpenVINOCausalLM(HFLM):
         # Replace the tokenizer with our wrapper
         self.tokenizer = TokenizerWrapper(self.tokenizer)
 
-    def _create_model_config(self):
-        """Create a config object for compatibility with evaluation harness."""
-        class ModelConfig:
-            def __init__(self, tokenizer):
-                # Common attributes that evaluation harness checks
-                self.max_position_embeddings = 4096  # Default max length
-                self.max_length = 4096
-                self.n_positions = 4096
-                self.max_seq_len = 4096
-                
-                # Model type info
-                self.model_type = "gemma"  # Based on the model path showing gemma
-                self.architectures = ["GemmaForCausalLM"]
-                
-                # Tokenizer info  
-                self.vocab_size = getattr(tokenizer, 'vocab_size', 256000)
-                self.pad_token_id = getattr(tokenizer, 'pad_token_id', 0)
-                self.eos_token_id = getattr(tokenizer, 'eos_token_id', 2)
-                self.bos_token_id = getattr(tokenizer, 'bos_token_id', 1)
+    def _create_model_config(self, pretrained_path):
+        """Create a minimal model config that provides required attributes."""
         
         # Create and return config
-        return ModelConfig(self.tokenizer)
+        class ModelConfig:
+            def __init__(self, tokenizer, pretrained):
+                # Get vocab size from tokenizer (now properly detected)
+                self.vocab_size = getattr(tokenizer, 'vocab_size', 50257)
+                
+                # Dynamic context length detection
+                self.max_position_embeddings = self._detect_max_length(pretrained)
+                self.max_length = self.max_position_embeddings
+                self.n_positions = self.max_position_embeddings
+                self.max_seq_len = self.max_position_embeddings
+                
+                # Dynamic model type detection
+                model_info = self._detect_model_type(pretrained)
+                self.model_type = model_info['type']
+                self.architectures = model_info['architectures']
+            
+            def _detect_model_type(self, pretrained_path):
+                """Detect model type from pretrained path or other indicators."""
+                try:
+                    pretrained_path = pretrained_path.lower()
+                    
+                    if 'gemma' in pretrained_path:
+                        return {'type': 'gemma', 'architectures': ['GemmaForCausalLM']}
+                    elif 'llama' in pretrained_path:
+                        return {'type': 'llama', 'architectures': ['LlamaForCausalLM']}
+                    elif 'gpt' in pretrained_path:
+                        return {'type': 'gpt2', 'architectures': ['GPT2LMHeadModel']}
+                    elif 'mistral' in pretrained_path:
+                        return {'type': 'mistral', 'architectures': ['MistralForCausalLM']}
+                    elif 'phi' in pretrained_path:
+                        return {'type': 'phi', 'architectures': ['PhiForCausalLM']}
+                    elif 'qwen' in pretrained_path:
+                        return {'type': 'qwen2', 'architectures': ['Qwen2ForCausalLM']}
+                    else:
+                        # Generic causal LM
+                        return {'type': 'causal_lm', 'architectures': ['CausalLM']}
+                except:
+                    return {'type': 'causal_lm', 'architectures': ['CausalLM']}
+            
+            def _detect_max_length(self, pretrained_path):
+                """Detect maximum sequence length from model architecture."""
+                try:
+                    # Common max lengths for different model families
+                    pretrained_path = pretrained_path.lower()
+                    
+                    if 'gemma' in pretrained_path:
+                        return 8192  # Gemma-2 supports 8K context
+                    elif 'llama' in pretrained_path:
+                        if '2' in pretrained_path:
+                            return 4096  # Llama 2
+                        else:
+                            return 2048  # Llama 1
+                    elif 'gpt' in pretrained_path:
+                        return 1024  # GPT-2 style
+                    elif 'mistral' in pretrained_path:
+                        return 32768 if 'v0.3' in pretrained_path else 8192
+                    elif 'phi' in pretrained_path:
+                        return 2048  # Phi models
+                    elif 'qwen' in pretrained_path:
+                        return 32768  # Qwen2 supports long context
+                    else:
+                        return 4096  # Safe default
+                except:
+                    return 4096  # Safe default
+        
+        # Create and return config
+        return ModelConfig(self.tokenizer, pretrained_path)
     
     @property
     def model(self):
@@ -271,13 +347,14 @@ class OpenVINOCausalLM(HFLM):
     
     @property
     def generation_config(self):
-        """Property to access generation config."""
+        """Property to access generation config - dynamically configured."""
+        vocab_size = getattr(self.tokenizer, 'vocab_size', 50257)
         return {
             'max_new_tokens': 50,
             'do_sample': False,
             'temperature': 1.0,
             'top_p': 1.0,
-            'top_k': 50,
+            'top_k': min(50, vocab_size // 100),  # Scale top_k with vocab size
             'repetition_penalty': 1.0,
             'echo': False,
             'logprobs': 0  # Default to no logprobs, will be overridden in _model_call
@@ -292,7 +369,7 @@ class OpenVINOCausalLM(HFLM):
         import numpy as np
         
         batch_size, seq_len = inps.shape
-        vocab_size = getattr(self.tokenizer, 'vocab_size', 256000)
+        vocab_size = getattr(self.tokenizer, 'vocab_size', 50257)  # Use detected vocab size
         
         # Try to use OpenVINO GenAI's logprobs functionality for real logits
         try:
@@ -312,7 +389,9 @@ class OpenVINOCausalLM(HFLM):
                     gen_config.max_new_tokens = 1  # Generate minimal tokens to get logprobs
                     gen_config.do_sample = False   # Use greedy to be deterministic
                     gen_config.echo = True         # Include input in output to get logprobs for input tokens
-                    gen_config.logprobs = min(vocab_size, 50)  # Limit logprobs to reasonable number
+                    # Dynamic logprobs limit based on vocab size
+                    logprobs_limit = min(vocab_size, max(50, vocab_size // 1000))  # Scale with vocab size
+                    gen_config.logprobs = logprobs_limit
                     
                     # Generate with the input to get logprobs
                     result = self.model(input_ids, gen_config)
