@@ -78,9 +78,7 @@ class OpenVINOCausalLM(HFLM):
         try:
             # Create OpenVINO GenAI LLMPipeline
             self._model = ov_genai.LLMPipeline(
-                pretrained,
-                self.openvino_device.upper(),
-                **ov_properties
+                pretrained, self.openvino_device.upper(), **ov_properties
             )
 
             # Get the tokenizer from the pipeline
