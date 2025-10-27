@@ -8,14 +8,14 @@ from lm_eval.models.huggingface import HFLM
 eval_logger = logging.getLogger(__name__)
 
 
-@register_model("openvino-causal")
+@register_model("openvino_genai")
 class OpenVINOCausalLM(HFLM):
     """
     OpenVINO GenAI provides a simple interface to run generative AI models optimized for
     Intel architectures using OpenVINO runtime with built-in performance optimizations.
 
     Example usage:
-    `lm_eval --model openvino-causal --model_args pretrained=gpt2,device=cpu,kv_cache=true --task wikitext`
+    `lm_eval --model openvino_genai --model_args pretrained=gpt2,device=cpu,kv_cache=true --task wikitext`
 
     This implementation uses OpenVINO GenAI library directly, avoiding external dependencies
     like llm_bench as suggested in PR #1862 comments.
