@@ -163,7 +163,7 @@ class OpenVINOCausalLM(HFLM):
         # Create progress bar
         pbar = tqdm(
             total=len(requests),
-            disable=(disable_tqdm or (self.rank != 0)),
+            disable=(disable_tqdm or (getattr(self, 'rank', 0) != 0)),
             desc="Running OpenVINO GenAI loglikelihood requests",
         )
 
@@ -184,14 +184,16 @@ class OpenVINOCausalLM(HFLM):
             
             # Handle OpenVINO GenAI tokenizer output - it returns TokenizedInputs
             if hasattr(whole_enc, 'input_ids'):
-                whole_enc_len = whole_enc.input_ids.shape[1] if hasattr(whole_enc.input_ids, 'shape') else len(whole_enc.input_ids)
+                input_ids = whole_enc.input_ids
+                whole_enc_len = input_ids.shape[1] if hasattr(input_ids, 'shape') and len(input_ids.shape) > 1 else len(input_ids)
             else:
                 whole_enc_len = len(whole_enc)
 
             # Encode just the context to find where continuation starts
             context_enc = self.ov_tokenizer.encode(context)
             if hasattr(context_enc, 'input_ids'):
-                context_enc_len = context_enc.input_ids.shape[1] if hasattr(context_enc.input_ids, 'shape') else len(context_enc.input_ids)
+                ctx_input_ids = context_enc.input_ids
+                context_enc_len = ctx_input_ids.shape[1] if hasattr(ctx_input_ids, 'shape') and len(ctx_input_ids.shape) > 1 else len(ctx_input_ids)
             else:
                 context_enc_len = len(context_enc)
 
@@ -256,7 +258,7 @@ class OpenVINOCausalLM(HFLM):
         # Create progress bar
         pbar = tqdm(
             total=len(requests),
-            disable=(disable_tqdm or (self.rank != 0)),
+            disable=(disable_tqdm or (getattr(self, 'rank', 0) != 0)),
             desc="Running OpenVINO GenAI generation requests",
         )
         
@@ -270,7 +272,7 @@ class OpenVINOCausalLM(HFLM):
                 # Extract max_gen_toks if provided, otherwise use default
                 if "max_gen_toks" in kwargs.keys() and "max_new_tokens" in kwargs.keys():
                     eval_logger.warning("Both max_gen_toks and max_new_tokens specified, using max_new_tokens")
-                max_gen_toks = kwargs.pop("max_gen_toks", self.max_gen_toks)
+                max_gen_toks = kwargs.pop("max_gen_toks", getattr(self, 'max_gen_toks', 256))
 
                 if "max_new_tokens" in kwargs.keys():
                     max_gen_toks = kwargs.pop("max_new_tokens")
