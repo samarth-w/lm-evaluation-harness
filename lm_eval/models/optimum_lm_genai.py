@@ -152,40 +152,44 @@ class OpenVINOCausalLM(HFLM):
             
             def encode(self, text, add_special_tokens=True, **kwargs):
                 """Encode text and return a list of token IDs (compatible with HF tokenizers)."""
+                import numpy as np
                 tokenized = self._tokenizer.encode(text)
+                
+                def flatten_to_int_list(obj):
+                    """Recursively flatten to a list of integers."""
+                    if isinstance(obj, (int, float)):
+                        return [int(obj)]
+                    elif isinstance(obj, (list, tuple)):
+                        result = []
+                        for item in obj:
+                            result.extend(flatten_to_int_list(item))
+                        return result
+                    elif hasattr(obj, 'data'):
+                        # OpenVINO tensor
+                        return flatten_to_int_list(obj.data.tolist())
+                    elif hasattr(obj, 'numpy'):
+                        return flatten_to_int_list(obj.numpy().tolist())
+                    elif hasattr(obj, 'tolist'):
+                        return flatten_to_int_list(obj.tolist())
+                    else:
+                        import numpy as np
+                        try:
+                            return flatten_to_int_list(np.array(obj).tolist())
+                        except:
+                            # If all else fails, try to convert to int
+                            try:
+                                return [int(obj)]
+                            except:
+                                return []
+                
                 # Convert OpenVINO GenAI TokenizedInputs to list of integers
                 if hasattr(tokenized, 'input_ids'):
-                    input_ids = tokenized.input_ids
-                    # Handle different tensor types
-                    if hasattr(input_ids, 'data'):
-                        # OpenVINO tensor - get numpy array and convert to list
-                        return input_ids.data.tolist()
-                    elif hasattr(input_ids, 'numpy'):
-                        # Tensor with numpy() method
-                        return input_ids.numpy().tolist()
-                    elif hasattr(input_ids, 'tolist'):
-                        # Already has tolist method
-                        return input_ids.tolist()
-                    else:
-                        # Try to convert to numpy array first
-                        import numpy as np
-                        try:
-                            return np.array(input_ids).tolist()
-                        except:
-                            # Last resort - try to iterate
-                            return list(input_ids)
+                    result = flatten_to_int_list(tokenized.input_ids)
                 else:
-                    # Fallback: assume tokenized is already a list or array
-                    if hasattr(tokenized, 'data'):
-                        return tokenized.data.tolist()
-                    elif hasattr(tokenized, 'tolist'):
-                        return tokenized.tolist()
-                    else:
-                        import numpy as np
-                        try:
-                            return np.array(tokenized).tolist()
-                        except:
-                            return list(tokenized)
+                    result = flatten_to_int_list(tokenized)
+                
+                # Ensure we return a flat list of integers
+                return [int(x) for x in result if isinstance(x, (int, float, np.integer, np.floating))]
             
             def decode(self, token_ids, skip_special_tokens=False, **kwargs):
                 """Decode token IDs to text."""
@@ -201,3 +205,5 @@ class OpenVINOCausalLM(HFLM):
         
         # Replace the tokenizer with our wrapper
         self.tokenizer = TokenizerWrapper(self.tokenizer)
+
+
