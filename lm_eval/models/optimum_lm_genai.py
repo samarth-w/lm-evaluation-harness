@@ -150,6 +150,24 @@ class OpenVINOCausalLM(HFLM):
                 except:
                     self.unk_token = '<unk>'
             
+            def encode(self, text, add_special_tokens=True, **kwargs):
+                """Encode text and return a list of token IDs (compatible with HF tokenizers)."""
+                tokenized = self._tokenizer.encode(text)
+                # Convert OpenVINO GenAI TokenizedInputs to list of integers
+                if hasattr(tokenized, 'input_ids'):
+                    return tokenized.input_ids.tolist() if hasattr(tokenized.input_ids, 'tolist') else list(tokenized.input_ids)
+                else:
+                    # Fallback: assume tokenized is already a list or array
+                    return tokenized.tolist() if hasattr(tokenized, 'tolist') else list(tokenized)
+            
+            def decode(self, token_ids, skip_special_tokens=False, **kwargs):
+                """Decode token IDs to text."""
+                return self._tokenizer.decode(token_ids)
+            
+            def __call__(self, text, **kwargs):
+                """Make the tokenizer callable like HF tokenizers."""
+                return self.encode(text, **kwargs)
+            
             def __getattr__(self, name):
                 # Delegate all other attributes/methods to the original tokenizer
                 return getattr(self._tokenizer, name)
