@@ -300,17 +300,18 @@ class OpenVINOCausalLM(HFLM):
                 
                 # Use generation with logprobs to get log probabilities
                 # We generate just one token to get logprobs for the input sequence
-                generation_config = self.generation_config.copy()
-                generation_config.update({
-                    'max_new_tokens': 1,  # Generate minimal tokens to get logprobs
-                    'logprobs': vocab_size,  # Get logprobs for all vocabulary
-                    'do_sample': False,  # Use greedy to be deterministic
-                    'echo': True  # Include input in output to get logprobs for input tokens
-                })
-                
                 try:
+                    import openvino_genai as ov_genai
+                    
+                    # Create proper GenerationConfig object
+                    gen_config = ov_genai.GenerationConfig()
+                    gen_config.max_new_tokens = 1  # Generate minimal tokens to get logprobs
+                    gen_config.do_sample = False   # Use greedy to be deterministic
+                    gen_config.echo = True         # Include input in output to get logprobs for input tokens
+                    gen_config.logprobs = min(vocab_size, 50)  # Limit logprobs to reasonable number
+                    
                     # Generate with the input to get logprobs
-                    result = self.model(input_ids, **generation_config)
+                    result = self.model(input_ids, gen_config)
                     
                     # Extract logprobs if available
                     if hasattr(result, 'logprobs') and result.logprobs is not None:
