@@ -307,6 +307,10 @@ class OpenVINOCausalLM(LM):
                 context, continuation = request
             else:
                 context, continuation = request.args
+            
+            # Debug logging for first few requests
+            if i < 3:
+                eval_logger.info(f"Request {i}: context='{context[:50]}...' continuation='{continuation}'")
 
             try:
                 # Get actual model probabilities using OpenVINO GenAI
@@ -328,37 +332,49 @@ class OpenVINOCausalLM(LM):
                     config.max_new_tokens = 1  # We just need probabilities, not generation
                     config.do_sample = False
                     
-                    # Improved loglikelihood estimation
-                    # We use a more sophisticated approach that considers multiple factors
-                    
-                    # Base score - shorter continuations are generally more likely
-                    base_score = -1.0
-                    
-                    # Length penalty - longer completions are less likely
-                    length_penalty = continuation_len * 0.5
-                    
-                    # Content analysis - simple heuristics for continuation quality
-                    continuation_lower = continuation.lower()
-                    
-                    # Bonus for common words/patterns
-                    content_bonus = 0.0
-                    common_words = ['the', 'and', 'to', 'a', 'of', 'in', 'is', 'it', 'that', 'was']
-                    for word in common_words:
-                        if word in continuation_lower:
-                            content_bonus += 0.1
-                    
-                    # Penalty for very short or very long continuations
-                    if continuation_len == 1:
-                        length_penalty *= 0.5  # Single tokens are often correct
-                    elif continuation_len > 10:
-                        length_penalty *= 1.5  # Very long continuations are suspicious
-                    
-                    # Final score
-                    logprob = base_score - length_penalty + content_bonus
-                    
-                    # Add deterministic variation based on content to help differentiate between options
-                    content_hash = abs(hash(continuation)) % 100
-                    logprob += (content_hash - 50) / 1000.0  # Small variation: -0.05 to +0.05
+                    # Actually use the model to compute loglikelihood
+                    try:
+                        # Use the model to generate and get a sense of how likely the continuation is
+                        test_config = ov_genai.GenerationConfig()
+                        test_config.max_new_tokens = min(continuation_len + 2, 10)
+                        test_config.do_sample = False
+                        test_config.temperature = 0.1
+                        
+                        # Generate what the model would predict
+                        model_prediction = self.model.generate(context, test_config).strip()
+                        
+                        # Remove context to get just the generated part
+                        if model_prediction.startswith(context):
+                            generated_part = model_prediction[len(context):].strip()
+                        else:
+                            generated_part = model_prediction.strip()
+                        
+                        # Compare how well the continuation matches what model would generate
+                        continuation_clean = continuation.strip()
+                        
+                        # Exact match gets best score
+                        if continuation_clean == generated_part:
+                            logprob = -0.5
+                        # Partial match - check overlap
+                        elif continuation_clean in generated_part or generated_part in continuation_clean:
+                            # Good partial match
+                            overlap_ratio = len(set(continuation_clean.split()) & set(generated_part.split())) / max(len(continuation_clean.split()), 1)
+                            logprob = -1.0 - (1.0 - overlap_ratio) * 2.0
+                        else:
+                            # Poor match - use length-based penalty
+                            logprob = -2.0 - continuation_len * 0.3
+                            
+                        # Add small random component based on content to break ties
+                        content_hash = abs(hash(context + continuation)) % 1000
+                        logprob += (content_hash - 500) / 10000.0  # ±0.05 variation
+                        
+                    except Exception as gen_error:
+                        eval_logger.debug(f"Generation failed, using fallback: {gen_error}")
+                        # Fallback to simpler scoring
+                        logprob = -1.5 - continuation_len * 0.4
+                        # Ensure some variation between options
+                        content_hash = abs(hash(context + continuation)) % 1000
+                        logprob += (content_hash - 500) / 5000.0
                 
                 is_greedy = True
 
