@@ -83,6 +83,9 @@ class OpenVINOCausalLM(HFLM):
 
             # Get the tokenizer from the pipeline
             self.tokenizer = self._model.get_tokenizer()
+            
+            # Create a wrapper to provide HuggingFace-compatible interface
+            self._setup_tokenizer_compatibility()
 
             eval_logger.info(f"Successfully loaded OpenVINO GenAI model: {pretrained}")
             eval_logger.info(f"Device: {self.openvino_device.upper()}")
@@ -95,3 +98,26 @@ class OpenVINOCausalLM(HFLM):
                 f"Make sure the model is compatible with OpenVINO GenAI and "
                 f"the device '{self.openvino_device}' is available."
             )
+
+    def _setup_tokenizer_compatibility(self):
+        """Add HuggingFace-compatible attributes to OpenVINO GenAI tokenizer."""
+        # Try to get vocab size from the tokenizer
+        if not hasattr(self.tokenizer, 'vocab_size'):
+            try:
+                # For OpenVINO GenAI tokenizer, we can estimate vocab size
+                # by trying to get the largest token ID
+                self.tokenizer.vocab_size = getattr(self.tokenizer, 'get_vocab_size', lambda: 32000)()
+            except:
+                # Fallback to a reasonable default for most models
+                self.tokenizer.vocab_size = 32000
+                eval_logger.warning("Could not determine vocab size, using default: 32000")
+        
+        # Add other compatibility attributes if needed
+        if not hasattr(self.tokenizer, 'pad_token_id'):
+            self.tokenizer.pad_token_id = getattr(self.tokenizer, 'get_pad_token_id', lambda: 0)()
+        
+        if not hasattr(self.tokenizer, 'eos_token_id'):
+            self.tokenizer.eos_token_id = getattr(self.tokenizer, 'get_eos_token_id', lambda: 2)()
+        
+        if not hasattr(self.tokenizer, 'bos_token_id'):
+            self.tokenizer.bos_token_id = getattr(self.tokenizer, 'get_bos_token_id', lambda: 1)()
