@@ -45,6 +45,10 @@ class OpenVINOCausalLM(HFLM):
         self.trust_remote_code = trust_remote_code
         self.kv_cache = kv_cache
         self.cache_dir = cache_dir
+        
+        # Initialize _model_config to None before super().__init__()
+        # It will be properly set in _create_model()
+        self._model_config = None
 
         super().__init__(
             device=self.openvino_device,
@@ -150,6 +154,13 @@ class OpenVINOCausalLM(HFLM):
     @property
     def config(self):
         """Property to access model config."""
+        if self._model_config is None:
+            # Return a minimal config if not yet initialized
+            class MinimalConfig:
+                def __init__(self):
+                    self.vocab_size = 256000  # Default, will be updated
+                    self.model_type = "unknown"
+            return MinimalConfig()
         return self._model_config
 
     def loglikelihood(self, requests, disable_tqdm: bool = False):
