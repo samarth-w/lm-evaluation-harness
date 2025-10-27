@@ -155,10 +155,37 @@ class OpenVINOCausalLM(HFLM):
                 tokenized = self._tokenizer.encode(text)
                 # Convert OpenVINO GenAI TokenizedInputs to list of integers
                 if hasattr(tokenized, 'input_ids'):
-                    return tokenized.input_ids.tolist() if hasattr(tokenized.input_ids, 'tolist') else list(tokenized.input_ids)
+                    input_ids = tokenized.input_ids
+                    # Handle different tensor types
+                    if hasattr(input_ids, 'data'):
+                        # OpenVINO tensor - get numpy array and convert to list
+                        return input_ids.data.tolist()
+                    elif hasattr(input_ids, 'numpy'):
+                        # Tensor with numpy() method
+                        return input_ids.numpy().tolist()
+                    elif hasattr(input_ids, 'tolist'):
+                        # Already has tolist method
+                        return input_ids.tolist()
+                    else:
+                        # Try to convert to numpy array first
+                        import numpy as np
+                        try:
+                            return np.array(input_ids).tolist()
+                        except:
+                            # Last resort - try to iterate
+                            return list(input_ids)
                 else:
                     # Fallback: assume tokenized is already a list or array
-                    return tokenized.tolist() if hasattr(tokenized, 'tolist') else list(tokenized)
+                    if hasattr(tokenized, 'data'):
+                        return tokenized.data.tolist()
+                    elif hasattr(tokenized, 'tolist'):
+                        return tokenized.tolist()
+                    else:
+                        import numpy as np
+                        try:
+                            return np.array(tokenized).tolist()
+                        except:
+                            return list(tokenized)
             
             def decode(self, token_ids, skip_special_tokens=False, **kwargs):
                 """Decode token IDs to text."""
