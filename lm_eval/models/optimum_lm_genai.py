@@ -77,10 +77,13 @@ class OpenVINOCausalLM(LM):
             )
 
             # Get the tokenizer from the pipeline
-            self.tokenizer = self.model.get_tokenizer()
+            self._ov_tokenizer = self.model.get_tokenizer()
             
-            # Create simple model config
-            self.config = self._detect_model_config(pretrained)
+            # Create simple model config first to get vocab size
+            self.config = self._detect_model_config(pretrained, self._ov_tokenizer)
+            
+            # Wrap tokenizer with additional attributes
+            self.tokenizer = self._wrap_tokenizer(self._ov_tokenizer)
 
             eval_logger.info(f"Successfully loaded OpenVINO GenAI model: {pretrained}")
             eval_logger.info(f"Device: {self.openvino_device.upper()}")
@@ -96,7 +99,41 @@ class OpenVINOCausalLM(LM):
                 f"the device '{self.openvino_device}' is available."
             )
 
-    def _detect_model_config(self, pretrained: str):
+    def _wrap_tokenizer(self, ov_tokenizer):
+        """Wrap OpenVINO GenAI tokenizer to provide HF-compatible interface."""
+        class TokenizerWrapper:
+            def __init__(self, ov_tokenizer, config):
+                self._tokenizer = ov_tokenizer
+                self.vocab_size = config.vocab_size
+                
+                # Try to get token IDs
+                try:
+                    self.eos_token_id = getattr(ov_tokenizer, 'eos_token_id', 2)
+                    self.bos_token_id = getattr(ov_tokenizer, 'bos_token_id', 1)
+                    self.pad_token_id = getattr(ov_tokenizer, 'pad_token_id', 0)
+                except:
+                    self.eos_token_id = 2
+                    self.bos_token_id = 1
+                    self.pad_token_id = 0
+            
+            def encode(self, text):
+                """Encode text to token IDs."""
+                result = self._tokenizer.encode(text)
+                if hasattr(result, 'input_ids'):
+                    return result.input_ids.tolist()
+                return result.tolist() if hasattr(result, 'tolist') else list(result)
+            
+            def decode(self, tokens):
+                """Decode token IDs to text."""
+                return self._tokenizer.decode(tokens)
+            
+            def __getattr__(self, name):
+                """Delegate to original tokenizer."""
+                return getattr(self._tokenizer, name)
+        
+        return TokenizerWrapper(ov_tokenizer, self.config)
+
+    def _detect_model_config(self, pretrained: str, tokenizer):
         """Create a simple config object with dynamic model detection."""
         class SimpleConfig:
             def __init__(self, model_path, tokenizer):
@@ -135,13 +172,20 @@ class OpenVINOCausalLM(LM):
                 # Try to get actual vocab size from tokenizer
                 try:
                     if hasattr(tokenizer, 'get_vocab_size'):
-                        self.vocab_size = tokenizer.get_vocab_size()
+                        actual_vocab_size = tokenizer.get_vocab_size()
+                        if actual_vocab_size and actual_vocab_size > 0:
+                            self.vocab_size = actual_vocab_size
                     elif hasattr(tokenizer, 'vocab_size'):
-                        self.vocab_size = tokenizer.vocab_size
-                except:
+                        actual_vocab_size = tokenizer.vocab_size
+                        if actual_vocab_size and actual_vocab_size > 0:
+                            self.vocab_size = actual_vocab_size
+                except Exception as e:
+                    eval_logger.debug(f"Could not get vocab size from tokenizer: {e}")
                     pass  # Keep default
+                    
+                eval_logger.info(f"Detected model: {self.model_type}, vocab_size: {self.vocab_size}")
 
-        return SimpleConfig(pretrained, self.tokenizer)
+        return SimpleConfig(pretrained, tokenizer)
 
     @property
     def eot_token_id(self):
