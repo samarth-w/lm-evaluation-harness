@@ -91,8 +91,8 @@ class OpenVINOCausalLM(HFLM):
             eval_logger.info(f"Device: {self.openvino_device.upper()}")
             eval_logger.info(f"KV Cache: {'enabled' if self.kv_cache else 'disabled'}")
             
-            # Add config attribute for compatibility
-            self._add_model_config()
+            # Add config attribute for compatibility (can't add to LLMPipeline, so add to self)
+            self.config = self._create_model_config()
 
         except Exception as e:
             raise RuntimeError(
@@ -209,8 +209,8 @@ class OpenVINOCausalLM(HFLM):
         # Replace the tokenizer with our wrapper
         self.tokenizer = TokenizerWrapper(self.tokenizer)
 
-    def _add_model_config(self):
-        """Add a config attribute to the model for compatibility with evaluation harness."""
+    def _create_model_config(self):
+        """Create a config object for compatibility with evaluation harness."""
         class ModelConfig:
             def __init__(self, tokenizer):
                 # Common attributes that evaluation harness checks
@@ -229,7 +229,22 @@ class OpenVINOCausalLM(HFLM):
                 self.eos_token_id = getattr(tokenizer, 'eos_token_id', 2)
                 self.bos_token_id = getattr(tokenizer, 'bos_token_id', 1)
         
-        # Add config to the model
-        self._model.config = ModelConfig(self.tokenizer)
+        # Create and return config
+        return ModelConfig(self.tokenizer)
+    
+    @property
+    def model(self):
+        """Property to access the model - add config attribute dynamically."""
+        # Create a wrapper that adds config to the OpenVINO model
+        class ModelWrapper:
+            def __init__(self, ov_model, config):
+                self._model = ov_model
+                self.config = config
+            
+            def __getattr__(self, name):
+                # Delegate all other attributes/methods to the original model
+                return getattr(self._model, name)
+        
+        return ModelWrapper(self._model, self.config)
 
 
