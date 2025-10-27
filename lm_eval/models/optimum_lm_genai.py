@@ -212,7 +212,7 @@ class OpenVINOCausalLM(HFLM):
     def _add_model_config(self):
         """Add a config attribute to the model for compatibility with evaluation harness."""
         class ModelConfig:
-            def __init__(self):
+            def __init__(self, tokenizer):
                 # Common attributes that evaluation harness checks
                 self.max_position_embeddings = 4096  # Default max length
                 self.max_length = 4096
@@ -224,12 +224,12 @@ class OpenVINOCausalLM(HFLM):
                 self.architectures = ["GemmaForCausalLM"]
                 
                 # Tokenizer info  
-                self.vocab_size = getattr(self.tokenizer, 'vocab_size', 32000)
-                self.pad_token_id = getattr(self.tokenizer, 'pad_token_id', 0)
-                self.eos_token_id = getattr(self.tokenizer, 'eos_token_id', 2)
-                self.bos_token_id = getattr(self.tokenizer, 'bos_token_id', 1)
+                self.vocab_size = getattr(tokenizer, 'vocab_size', 32000)
+                self.pad_token_id = getattr(tokenizer, 'pad_token_id', 0)
+                self.eos_token_id = getattr(tokenizer, 'eos_token_id', 2)
+                self.bos_token_id = getattr(tokenizer, 'bos_token_id', 1)
         
         # Add config to the model
-        self._model.config = ModelConfig()
+        self._model.config = ModelConfig(self.tokenizer)
 
 
