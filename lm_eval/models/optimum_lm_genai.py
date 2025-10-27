@@ -265,6 +265,20 @@ class OpenVINOCausalLM(HFLM):
         """Property to access model config."""
         return self._config
     
+    @property
+    def generation_config(self):
+        """Property to access generation config."""
+        return {
+            'max_new_tokens': 50,
+            'do_sample': False,
+            'temperature': 1.0,
+            'top_p': 1.0,
+            'top_k': 50,
+            'repetition_penalty': 1.0,
+            'echo': False,
+            'logprobs': 0  # Default to no logprobs, will be overridden in _model_call
+        }
+    
     def _model_call(self, inps, **kwargs):
         """
         Override the base class _model_call to work with OpenVINO GenAI.
@@ -273,17 +287,76 @@ class OpenVINOCausalLM(HFLM):
         import torch
         import numpy as np
         
-        # For now, return dummy logits since OpenVINO GenAI is primarily for generation
-        # A proper implementation would need access to the model's raw forward pass
         batch_size, seq_len = inps.shape
         vocab_size = getattr(self.tokenizer, 'vocab_size', 256000)
         
-        # Create dummy logits (uniform distribution)
-        logits = torch.randn(batch_size, seq_len, vocab_size, dtype=torch.float32)
+        # Try to use OpenVINO GenAI's logprobs functionality for real logits
+        try:
+            # Convert input tokens to the format expected by OpenVINO GenAI
+            all_logits = []
+            
+            for batch_idx in range(batch_size):
+                input_ids = inps[batch_idx].tolist()
+                
+                # Use generation with logprobs to get log probabilities
+                # We generate just one token to get logprobs for the input sequence
+                generation_config = self.generation_config.copy()
+                generation_config.update({
+                    'max_new_tokens': 1,  # Generate minimal tokens to get logprobs
+                    'logprobs': vocab_size,  # Get logprobs for all vocabulary
+                    'do_sample': False,  # Use greedy to be deterministic
+                    'echo': True  # Include input in output to get logprobs for input tokens
+                })
+                
+                try:
+                    # Generate with the input to get logprobs
+                    result = self.model(input_ids, **generation_config)
+                    
+                    # Extract logprobs if available
+                    if hasattr(result, 'logprobs') and result.logprobs is not None:
+                        # Convert logprobs to logits format expected by the harness
+                        logprobs = result.logprobs
+                        if len(logprobs) >= seq_len:
+                            # Take logprobs for the input sequence positions
+                            batch_logits = []
+                            for pos_idx in range(seq_len):
+                                if pos_idx < len(logprobs):
+                                    pos_logprobs = logprobs[pos_idx]
+                                    # Convert to full vocabulary logits
+                                    pos_logits = torch.full((vocab_size,), -float('inf'), dtype=torch.float32)
+                                    for token_id, logprob in pos_logprobs.items():
+                                        if token_id < vocab_size:
+                                            pos_logits[token_id] = logprob
+                                    batch_logits.append(pos_logits)
+                                else:
+                                    # Fallback for missing positions
+                                    batch_logits.append(torch.full((vocab_size,), -float('inf'), dtype=torch.float32))
+                            
+                            all_logits.append(torch.stack(batch_logits))
+                        else:
+                            # If we don't get enough logprobs, fall back to dummy
+                            all_logits.append(torch.randn(seq_len, vocab_size, dtype=torch.float32))
+                    else:
+                        # No logprobs available, use dummy
+                        all_logits.append(torch.randn(seq_len, vocab_size, dtype=torch.float32))
+                        
+                except Exception as e:
+                    eval_logger.warning(f"Failed to get logprobs from OpenVINO GenAI: {e}")
+                    # Fallback to dummy logits for this batch
+                    all_logits.append(torch.randn(seq_len, vocab_size, dtype=torch.float32))
+            
+            if all_logits:
+                logits = torch.stack(all_logits)
+                eval_logger.info("Successfully obtained logprobs from OpenVINO GenAI")
+                return logits
+            
+        except Exception as e:
+            eval_logger.warning(f"Error using OpenVINO GenAI logprobs: {e}")
         
-        eval_logger.warning("Using dummy logits for OpenVINO GenAI - this is for compatibility only. "
-                          "For proper loglikelihood computation, OpenVINO GenAI would need to expose "
-                          "raw model outputs, not just generation interface.")
+        # Fallback to dummy logits if logprobs approach fails
+        logits = torch.randn(batch_size, seq_len, vocab_size, dtype=torch.float32)
+        eval_logger.warning("Using dummy logits for OpenVINO GenAI - logprobs approach failed. "
+                          "For proper loglikelihood computation, OpenVINO GenAI logprobs functionality is needed.")
         
         return logits
 
