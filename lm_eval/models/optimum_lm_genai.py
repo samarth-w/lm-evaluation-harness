@@ -1,6 +1,5 @@
 import logging
 from importlib.util import find_spec
-from pathlib import Path
 
 from lm_eval.api.registry import register_model
 from lm_eval.models.huggingface import HFLM
@@ -12,12 +11,12 @@ eval_logger = logging.getLogger(__name__)
 @register_model("openvino-causal")
 class OpenVINOCausalLM(HFLM):
     """
-    OpenVINO GenAI provides a simple interface to run generative AI models optimized for 
+    OpenVINO GenAI provides a simple interface to run generative AI models optimized for
     Intel® architectures using OpenVINO™ runtime with built-in performance optimizations.
 
     Example usage:
     `lm_eval --model openvino-causal --model_args pretrained=gpt2,device=cpu,kv_cache=true --task wikitext`
-    
+
     This implementation uses OpenVINO GenAI library directly, avoiding external dependencies
     like llm_bench as suggested in PR #1862 comments.
     """
@@ -56,26 +55,26 @@ class OpenVINOCausalLM(HFLM):
                 "package `openvino-genai` is not installed. "
                 "Please install it via `pip install openvino-genai`"
             )
-        
+
         import openvino_genai as ov_genai
-        
+
         # Configure OpenVINO properties
         ov_properties = {
-            'PERFORMANCE_HINT': 'LATENCY',
-            'NUM_STREAMS': '1',
-            'CACHE_DIR': ''
+            "PERFORMANCE_HINT": "LATENCY",
+            "NUM_STREAMS": "1",
+            "CACHE_DIR": "",
         }
-        
+
         # Configure KV cache if enabled
         if self.kv_cache:
             eval_logger.info("KV cache enabled with u8 precision")
-            ov_properties['KV_CACHE_PRECISION'] = 'u8'
-            ov_properties['DYNAMIC_QUANTIZATION_GROUP_SIZE'] = '32'
-        
+            ov_properties["KV_CACHE_PRECISION"] = "u8"
+            ov_properties["DYNAMIC_QUANTIZATION_GROUP_SIZE"] = "32"
+
         # Handle additional model kwargs
         model_kwargs = kwargs if kwargs else {}
-        ov_properties.update(model_kwargs.get('ov_config', {}))
-        
+        ov_properties.update(model_kwargs.get("ov_config", {}))
+
         try:
             # Create OpenVINO GenAI LLMPipeline
             self._model = ov_genai.LLMPipeline(
@@ -83,14 +82,14 @@ class OpenVINOCausalLM(HFLM):
                 self.openvino_device.upper(),
                 **ov_properties
             )
-            
+
             # Get the tokenizer from the pipeline
             self.tokenizer = self._model.get_tokenizer()
-            
+
             eval_logger.info(f"Successfully loaded OpenVINO GenAI model: {pretrained}")
             eval_logger.info(f"Device: {self.openvino_device.upper()}")
             eval_logger.info(f"KV Cache: {'enabled' if self.kv_cache else 'disabled'}")
-            
+
         except Exception as e:
             raise RuntimeError(
                 f"Failed to load OpenVINO GenAI model '{pretrained}'. "
