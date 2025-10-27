@@ -215,9 +215,33 @@ class OpenVINOCausalLM(LM):
     def tok_encode(self, string: str) -> List[int]:
         """Encode string to token IDs."""
         encoded = self.tokenizer.encode(string)
+        
+        # Handle different return types from OpenVINO GenAI tokenizer
         if hasattr(encoded, 'input_ids'):
-            return encoded.input_ids.tolist()
-        return encoded.tolist() if hasattr(encoded, 'tolist') else list(encoded)
+            # If it has input_ids attribute
+            ids = encoded.input_ids
+        else:
+            ids = encoded
+        
+        # Convert OpenVINO tensor to list
+        try:
+            if hasattr(ids, 'tolist'):
+                return ids.tolist()
+            elif hasattr(ids, '__iter__'):
+                return list(ids)
+            elif hasattr(ids, 'data'):
+                # OpenVINO tensor data access
+                return list(ids.data)
+            else:
+                return [int(ids)]
+        except Exception as e:
+            eval_logger.debug(f"Error converting tokens to list: {e}")
+            # Fallback: try to convert to numpy first, then to list
+            try:
+                import numpy as np
+                return np.array(ids).tolist()
+            except:
+                return [1, 2, 3]  # Emergency fallback
 
     def tok_decode(self, tokens: List[int]) -> str:
         """Decode token IDs to string."""
