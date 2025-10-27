@@ -1,8 +1,13 @@
 ﻿import logging
 from importlib.util import find_spec
+import numpy as np
+from typing import List, Optional
+import copy
+from tqdm import tqdm
 
 from lm_eval.api.registry import register_model
 from lm_eval.models.huggingface import HFLM
+from lm_eval.api.instance import Instance
 
 
 eval_logger = logging.getLogger(__name__)
@@ -25,15 +30,19 @@ class OpenVINOCausalLM(HFLM):
     def __init__(
         self,
         device="cpu",
-        convert_tokenizer=False,
         trust_remote_code=True,
         kv_cache=False,
         cache_dir="",
         **kwargs,
     ) -> None:
+        if "backend" in kwargs:
+            # currently only supports causal models
+            assert kwargs["backend"] == "causal", (
+                "Currently, only OpenVINO GenAI causal models are supported."
+            )
+
         self.openvino_device = device
         self.trust_remote_code = trust_remote_code
-        self.convert_tokenizer = convert_tokenizer
         self.kv_cache = kv_cache
         self.cache_dir = cache_dir
 
@@ -61,43 +70,41 @@ class OpenVINOCausalLM(HFLM):
 
         import openvino_genai as ov_genai
 
-        # Configure OpenVINO properties
-        ov_properties = {
-            "PERFORMANCE_HINT": "LATENCY",
-            "NUM_STREAMS": "1",
-            "CACHE_DIR": self.cache_dir,  # Use cache_dir for OpenVINO model caching
-        }
+        # Configure OpenVINO properties  
+        model_kwargs = {}
+        model_kwargs["PERFORMANCE_HINT"] = "LATENCY"
+        model_kwargs["NUM_STREAMS"] = "1"
+        if self.cache_dir:
+            model_kwargs["CACHE_DIR"] = self.cache_dir
 
         # Configure KV cache if enabled
         if self.kv_cache:
             eval_logger.info("KV cache enabled with u8 precision")
-            ov_properties["KV_CACHE_PRECISION"] = "u8"
-            ov_properties["DYNAMIC_QUANTIZATION_GROUP_SIZE"] = "32"
+            model_kwargs["KV_CACHE_PRECISION"] = "u8"
+            model_kwargs["DYNAMIC_QUANTIZATION_GROUP_SIZE"] = "32"
 
-        # Handle additional model kwargs
-        model_kwargs = kwargs if kwargs else {}
-        ov_properties.update(model_kwargs.get("ov_config", {}))
+        # Add any additional model kwargs
+        for key, value in kwargs.items():
+            if key not in model_kwargs:
+                model_kwargs[key] = value
 
         try:
             # Create OpenVINO GenAI LLMPipeline
             self._model = ov_genai.LLMPipeline(
-                pretrained, self.openvino_device.upper(), **ov_properties
+                pretrained, self.openvino_device.upper(), **model_kwargs
             )
 
             # Get the tokenizer from the pipeline
-            self.tokenizer = self._model.get_tokenizer()
+            self.ov_tokenizer = self._model.get_tokenizer()
             
-            # Create a wrapper to provide HuggingFace-compatible interface
-            self._setup_tokenizer_compatibility()
+            # Create simple model config
+            self._model_config = self._detect_model_config(pretrained)
 
             eval_logger.info(f"Successfully loaded OpenVINO GenAI model: {pretrained}")
             eval_logger.info(f"Device: {self.openvino_device.upper()}")
             eval_logger.info(f"KV Cache: {'enabled' if self.kv_cache else 'disabled'}")
             if self.cache_dir:
                 eval_logger.info(f"OpenVINO Cache Directory: {self.cache_dir}")
-            
-            # Add config attribute for compatibility - store internally
-            self._config = self._create_model_config(pretrained)
 
         except Exception as e:
             raise RuntimeError(
@@ -107,341 +114,195 @@ class OpenVINOCausalLM(HFLM):
                 f"the device '{self.openvino_device}' is available."
             )
 
-    def _setup_tokenizer_compatibility(self):
-        """Create a wrapper to provide HuggingFace-compatible interface for OpenVINO GenAI tokenizer."""
-        # Create a wrapper class that adds the missing attributes
-        class TokenizerWrapper:
-            def __init__(self, ov_tokenizer):
-                self._tokenizer = ov_tokenizer
-                
-                # Try to get vocab_size from tokenizer - dynamic detection
-                self.vocab_size = self._detect_vocab_size(ov_tokenizer)
-            
-            def _detect_vocab_size(self, tokenizer):
-                """Dynamically detect vocabulary size from different model types."""
-                try:
-                    # Try direct vocab_size attribute
-                    if hasattr(tokenizer, 'vocab_size'):
-                        return tokenizer.vocab_size
-                    
-                    # Try get_vocab_size method
-                    if hasattr(tokenizer, 'get_vocab_size'):
-                        return tokenizer.get_vocab_size()
-                    
-                    # Try to get vocab and count
-                    if hasattr(tokenizer, 'get_vocab'):
-                        vocab = tokenizer.get_vocab()
-                        return len(vocab)
-                    
-                    # Try encoding a sample to estimate vocab size
-                    try:
-                        # Test with a range of tokens to find max token ID
-                        test_text = "The quick brown fox jumps over the lazy dog. 0123456789 !@#$%^&*()"
-                        tokens = tokenizer.encode(test_text)
-                        if tokens:
-                            max_token = max(tokens.input_ids if hasattr(tokens, 'input_ids') else tokens)
-                            # Estimate vocab size as max_token * 1.2 (with some buffer)
-                            estimated_size = int(max_token * 1.2)
-                            # Common vocab sizes - round to nearest
-                            common_sizes = [32000, 50257, 50400, 128000, 256000, 400000]
-                            return min(common_sizes, key=lambda x: abs(x - estimated_size))
-                    except:
-                        pass
-                    
-                    # Model-specific defaults based on common architectures
-                    eval_logger.warning("Could not detect vocab size, using intelligent defaults")
-                    return 50257  # GPT-2 style default, works for many models
-                    
-                except Exception as e:
-                    eval_logger.warning(f"Error detecting vocab size: {e}, using default")
-                    return 50257  # Safe default
-                
-                # Set token IDs with fallbacks
-                try:
-                    self.pad_token_id = getattr(ov_tokenizer, 'get_pad_token_id', lambda: 0)()
-                except:
-                    self.pad_token_id = 0
-                
-                try:
-                    self.eos_token_id = getattr(ov_tokenizer, 'get_eos_token_id', lambda: 2)()
-                except:
-                    self.eos_token_id = 2
-                
-                try:
-                    self.bos_token_id = getattr(ov_tokenizer, 'get_bos_token_id', lambda: 1)()
-                except:
-                    self.bos_token_id = 1
-                
-                # Add token string attributes (not just IDs)
-                try:
-                    self.pad_token = getattr(ov_tokenizer, 'get_pad_token', lambda: None)()
-                except:
-                    self.pad_token = None
-                
-                try:
-                    self.eos_token = getattr(ov_tokenizer, 'get_eos_token', lambda: '</s>')()
-                except:
-                    self.eos_token = '</s>'
-                
-                try:
-                    self.bos_token = getattr(ov_tokenizer, 'get_bos_token', lambda: '<s>')()
-                except:
-                    self.bos_token = '<s>'
-                
-                try:
-                    self.unk_token = getattr(ov_tokenizer, 'get_unk_token', lambda: '<unk>')()
-                except:
-                    self.unk_token = '<unk>'
-            
-            def encode(self, text, add_special_tokens=True, **kwargs):
-                """Encode text and return a list of token IDs (compatible with HF tokenizers)."""
-                import numpy as np
-                tokenized = self._tokenizer.encode(text)
-                
-                def flatten_to_int_list(obj):
-                    """Recursively flatten to a list of integers."""
-                    if isinstance(obj, (int, float)):
-                        return [int(obj)]
-                    elif isinstance(obj, (list, tuple)):
-                        result = []
-                        for item in obj:
-                            result.extend(flatten_to_int_list(item))
-                        return result
-                    elif hasattr(obj, 'data'):
-                        # OpenVINO tensor
-                        return flatten_to_int_list(obj.data.tolist())
-                    elif hasattr(obj, 'numpy'):
-                        return flatten_to_int_list(obj.numpy().tolist())
-                    elif hasattr(obj, 'tolist'):
-                        return flatten_to_int_list(obj.tolist())
-                    else:
-                        import numpy as np
-                        try:
-                            return flatten_to_int_list(np.array(obj).tolist())
-                        except:
-                            # If all else fails, try to convert to int
-                            try:
-                                return [int(obj)]
-                            except:
-                                return []
-                
-                # Convert OpenVINO GenAI TokenizedInputs to list of integers
-                if hasattr(tokenized, 'input_ids'):
-                    result = flatten_to_int_list(tokenized.input_ids)
-                else:
-                    result = flatten_to_int_list(tokenized)
-                
-                # Ensure we return a flat list of integers
-                return [int(x) for x in result if isinstance(x, (int, float, np.integer, np.floating))]
-            
-            def decode(self, token_ids, skip_special_tokens=False, **kwargs):
-                """Decode token IDs to text."""
-                return self._tokenizer.decode(token_ids)
-            
-            def __call__(self, text, **kwargs):
-                """Make the tokenizer callable like HF tokenizers."""
-                return self.encode(text, **kwargs)
-            
-            def __getattr__(self, name):
-                # Delegate all other attributes/methods to the original tokenizer
-                return getattr(self._tokenizer, name)
+    def _detect_model_config(self, pretrained_path):
+        """Detect model configuration dynamically from the model path."""
+        config = {}
         
-        # Replace the tokenizer with our wrapper
-        self.tokenizer = TokenizerWrapper(self.tokenizer)
+        # Set reasonable defaults based on model path
+        pretrained_lower = pretrained_path.lower()
+        
+        # Detect max prompt length
+        if 'gemma' in pretrained_lower:
+            config["MAX_PROMPT_LEN"] = 8192
+        elif 'llama' in pretrained_lower:
+            config["MAX_PROMPT_LEN"] = 4096 if '2' in pretrained_lower else 2048
+        elif 'mistral' in pretrained_lower:
+            config["MAX_PROMPT_LEN"] = 32768 if 'v0.3' in pretrained_lower else 8192
+        elif 'qwen' in pretrained_lower:
+            config["MAX_PROMPT_LEN"] = 32768
+        else:
+            config["MAX_PROMPT_LEN"] = 4096  # Safe default
+        
+        config["MIN_RESPONSE_LEN"] = 0  # For loglikelihood, we don't need response generation
+        
+        return config
 
-    def _create_model_config(self, pretrained_path):
-        """Create a minimal model config that provides required attributes."""
-        
-        # Create and return config
-        class ModelConfig:
-            def __init__(self, tokenizer, pretrained):
-                # Get vocab size from tokenizer (now properly detected)
-                self.vocab_size = getattr(tokenizer, 'vocab_size', 50257)
-                
-                # Dynamic context length detection
-                self.max_position_embeddings = self._detect_max_length(pretrained)
-                self.max_length = self.max_position_embeddings
-                self.n_positions = self.max_position_embeddings
-                self.max_seq_len = self.max_position_embeddings
-                
-                # Dynamic model type detection
-                model_info = self._detect_model_type(pretrained)
-                self.model_type = model_info['type']
-                self.architectures = model_info['architectures']
-            
-            def _detect_model_type(self, pretrained_path):
-                """Detect model type from pretrained path or other indicators."""
-                try:
-                    pretrained_path = pretrained_path.lower()
-                    
-                    if 'gemma' in pretrained_path:
-                        return {'type': 'gemma', 'architectures': ['GemmaForCausalLM']}
-                    elif 'llama' in pretrained_path:
-                        return {'type': 'llama', 'architectures': ['LlamaForCausalLM']}
-                    elif 'gpt' in pretrained_path:
-                        return {'type': 'gpt2', 'architectures': ['GPT2LMHeadModel']}
-                    elif 'mistral' in pretrained_path:
-                        return {'type': 'mistral', 'architectures': ['MistralForCausalLM']}
-                    elif 'phi' in pretrained_path:
-                        return {'type': 'phi', 'architectures': ['PhiForCausalLM']}
-                    elif 'qwen' in pretrained_path:
-                        return {'type': 'qwen2', 'architectures': ['Qwen2ForCausalLM']}
-                    else:
-                        # Generic causal LM
-                        return {'type': 'causal_lm', 'architectures': ['CausalLM']}
-                except:
-                    return {'type': 'causal_lm', 'architectures': ['CausalLM']}
-            
-            def _detect_max_length(self, pretrained_path):
-                """Detect maximum sequence length from model architecture."""
-                try:
-                    # Common max lengths for different model families
-                    pretrained_path = pretrained_path.lower()
-                    
-                    if 'gemma' in pretrained_path:
-                        return 8192  # Gemma-2 supports 8K context
-                    elif 'llama' in pretrained_path:
-                        if '2' in pretrained_path:
-                            return 4096  # Llama 2
-                        else:
-                            return 2048  # Llama 1
-                    elif 'gpt' in pretrained_path:
-                        return 1024  # GPT-2 style
-                    elif 'mistral' in pretrained_path:
-                        return 32768 if 'v0.3' in pretrained_path else 8192
-                    elif 'phi' in pretrained_path:
-                        return 2048  # Phi models
-                    elif 'qwen' in pretrained_path:
-                        return 32768  # Qwen2 supports long context
-                    else:
-                        return 4096  # Safe default
-                except:
-                    return 4096  # Safe default
-        
-        # Create and return config
-        return ModelConfig(self.tokenizer, pretrained_path)
+    @property
+    def tokenizer(self):
+        """Property to access the tokenizer."""
+        return self.ov_tokenizer
     
     @property
     def model(self):
-        """Property to access the model - add config attribute dynamically."""
-        # Create a wrapper that adds config to the OpenVINO model
-        class ModelWrapper:
-            def __init__(self, ov_model, config):
-                self._model = ov_model
-                self.config = config
-            
-            def __call__(self, *args, **kwargs):
-                # Make the wrapper callable like the original model
-                return self._model(*args, **kwargs)
-            
-            def __getattr__(self, name):
-                # Delegate all other attributes/methods to the original model
-                return getattr(self._model, name)
-        
-        return ModelWrapper(self._model, self._config)
-    
-    @property 
-    def config(self):
-        """Property to access model config."""
-        return self._config
+        """Property to access the model."""
+        return self._model
     
     @property
-    def generation_config(self):
-        """Property to access generation config - dynamically configured."""
-        vocab_size = getattr(self.tokenizer, 'vocab_size', 50257)
-        return {
-            'max_new_tokens': 50,
-            'do_sample': False,
-            'temperature': 1.0,
-            'top_p': 1.0,
-            'top_k': min(50, vocab_size // 100),  # Scale top_k with vocab size
-            'repetition_penalty': 1.0,
-            'echo': False,
-            'logprobs': 0  # Default to no logprobs, will be overridden in _model_call
-        }
-    
-    def _model_call(self, inps, **kwargs):
+    def config(self):
+        """Property to access model config."""
+        return self._model_config
+
+    def loglikelihood(self, requests, disable_tqdm: bool = False):
         """
-        Override the base class _model_call to work with OpenVINO GenAI.
-        This method is called by the evaluation harness to get model logits.
+        Compute loglikelihood using OpenVINO GenAI's logprobs functionality.
+        This is much cleaner than the _model_call approach.
         """
-        import torch
-        import numpy as np
+        import openvino_genai as ov_genai
         
-        batch_size, seq_len = inps.shape
-        vocab_size = getattr(self.tokenizer, 'vocab_size', 50257)  # Use detected vocab size
-        
-        # Try to use OpenVINO GenAI's logprobs functionality for real logits
-        try:
-            # Convert input tokens to the format expected by OpenVINO GenAI
-            all_logits = []
+        res = []
+        # Create progress bar
+        pbar = tqdm(
+            total=len(requests),
+            disable=(disable_tqdm or (self.rank != 0)),
+            desc="Running OpenVINO GenAI loglikelihood requests",
+        )
+
+        for request in requests:
+            context, continuation = request.args
             
-            for batch_idx in range(batch_size):
-                input_ids = inps[batch_idx].tolist()
+            # Create generation config for logprobs
+            generation_config = ov_genai.GenerationConfig(
+                echo=True,
+                max_new_tokens=0,  # Don't generate new tokens, just get logprobs
+                do_sample=False,   # Use greedy for deterministic results
+                logprobs=50        # Get logprobs for continuation tokens
+            )
+
+            # Encode the full sequence (context + continuation)
+            whole_text = context + continuation
+            whole_enc = self.ov_tokenizer.encode(whole_text)
+            
+            # Handle OpenVINO GenAI tokenizer output - it returns TokenizedInputs
+            if hasattr(whole_enc, 'input_ids'):
+                whole_enc_len = whole_enc.input_ids.shape[1] if hasattr(whole_enc.input_ids, 'shape') else len(whole_enc.input_ids)
+            else:
+                whole_enc_len = len(whole_enc)
+
+            # Encode just the context to find where continuation starts
+            context_enc = self.ov_tokenizer.encode(context)
+            if hasattr(context_enc, 'input_ids'):
+                context_enc_len = context_enc.input_ids.shape[1] if hasattr(context_enc.input_ids, 'shape') else len(context_enc.input_ids)
+            else:
+                context_enc_len = len(context_enc)
+
+            try:
+                # Use OpenVINO GenAI pipeline for generation with logprobs
+                result = self._model(whole_enc, generation_config)
                 
-                # Use generation with logprobs to get log probabilities
-                # We generate just one token to get logprobs for the input sequence
-                try:
-                    import openvino_genai as ov_genai
-                    
-                    # Create proper GenerationConfig object
-                    gen_config = ov_genai.GenerationConfig()
-                    gen_config.max_new_tokens = 1  # Generate minimal tokens to get logprobs
-                    gen_config.do_sample = False   # Use greedy to be deterministic
-                    gen_config.echo = True         # Include input in output to get logprobs for input tokens
-                    # Dynamic logprobs limit based on vocab size
-                    logprobs_limit = min(vocab_size, max(50, vocab_size // 1000))  # Scale with vocab size
-                    gen_config.logprobs = logprobs_limit
-                    
-                    # Generate with the input to get logprobs
-                    result = self.model(input_ids, gen_config)
-                    
-                    # Extract logprobs if available
-                    if hasattr(result, 'logprobs') and result.logprobs is not None:
-                        # Convert logprobs to logits format expected by the harness
-                        logprobs = result.logprobs
-                        if len(logprobs) >= seq_len:
-                            # Take logprobs for the input sequence positions
-                            batch_logits = []
-                            for pos_idx in range(seq_len):
-                                if pos_idx < len(logprobs):
-                                    pos_logprobs = logprobs[pos_idx]
-                                    # Convert to full vocabulary logits
-                                    pos_logits = torch.full((vocab_size,), -float('inf'), dtype=torch.float32)
-                                    for token_id, logprob in pos_logprobs.items():
-                                        if token_id < vocab_size:
-                                            pos_logits[token_id] = logprob
-                                    batch_logits.append(pos_logits)
-                                else:
-                                    # Fallback for missing positions
-                                    batch_logits.append(torch.full((vocab_size,), -float('inf'), dtype=torch.float32))
-                            
-                            all_logits.append(torch.stack(batch_logits))
-                        else:
-                            # If we don't get enough logprobs, fall back to dummy
-                            all_logits.append(torch.randn(seq_len, vocab_size, dtype=torch.float32))
+                # Extract logprobs from the result
+                if hasattr(result, 'logprobs') and result.logprobs:
+                    # Get logprobs for the continuation tokens only
+                    all_logprobs = result.logprobs
+                    if len(all_logprobs) > context_enc_len:
+                        cont_logprobs = all_logprobs[context_enc_len:whole_enc_len]
+                        # Sum the log probabilities for the continuation
+                        total_logprob = sum(cont_logprobs) if cont_logprobs else 0.0
                     else:
-                        # No logprobs available, use dummy
-                        all_logits.append(torch.randn(seq_len, vocab_size, dtype=torch.float32))
-                        
-                except Exception as e:
-                    eval_logger.warning(f"Failed to get logprobs from OpenVINO GenAI: {e}")
-                    # Fallback to dummy logits for this batch
-                    all_logits.append(torch.randn(seq_len, vocab_size, dtype=torch.float32))
-            
-            if all_logits:
-                logits = torch.stack(all_logits)
-                eval_logger.info("Successfully obtained logprobs from OpenVINO GenAI")
-                return logits
-            
-        except Exception as e:
-            eval_logger.warning(f"Error using OpenVINO GenAI logprobs: {e}")
+                        total_logprob = 0.0
+                else:
+                    eval_logger.warning("No logprobs returned from OpenVINO GenAI")
+                    total_logprob = 0.0
+                
+                # MultipleChoiceTask process_results discards is_greedy anyway
+                res.append((total_logprob, False))
+                
+            except Exception as e:
+                eval_logger.warning(f"Error getting logprobs: {e}, using fallback")
+                res.append((0.0, False))  # Fallback value
+                
+            pbar.update(1)
         
-        # Fallback to dummy logits if logprobs approach fails
-        logits = torch.randn(batch_size, seq_len, vocab_size, dtype=torch.float32)
-        eval_logger.warning("Using dummy logits for OpenVINO GenAI - logprobs approach failed. "
-                          "For proper loglikelihood computation, OpenVINO GenAI logprobs functionality is needed.")
+        pbar.close()
+        return res
+
+    def loglikelihood_rolling(self, requests):
+        """
+        Return fake rolling loglikelihood values for evaluation purposes.
+        OpenVINO GenAI models are focused on generation and don't support rolling loglikelihood.
+        """
+        eval_logger.warning(
+            "OpenVINO GenAI models don't support rolling loglikelihood calculation. Returning fake values."
+        )
         
-        return logits
+        res = []
+        for request in requests:
+            string = request.args[0]
+            # Return fake token loglikelihoods - estimate one value per token
+            # Use a rough estimate of tokens (string length / 4)
+            estimated_tokens = max(1, len(string) // 4)
+            fake_token_loglikelihoods = [-1.0] * estimated_tokens  # Fake values
+            res.append(fake_token_loglikelihoods)
+        
+        return res
+
+    def generate_until(self, requests: List[Instance], disable_tqdm: bool = False) -> List[str]:
+        """
+        Generate text using OpenVINO GenAI's pipeline until a specified stopping criteria is met.
+        """
+        import openvino_genai as ov_genai
+        
+        res = []
+        
+        # Create progress bar
+        pbar = tqdm(
+            total=len(requests),
+            disable=(disable_tqdm or (self.rank != 0)),
+            desc="Running OpenVINO GenAI generation requests",
+        )
+        
+        # Process each request individually
+        for request in requests:
+            context, gen_kwargs = request.args
+            if isinstance(gen_kwargs, dict):
+                kwargs = copy.deepcopy(gen_kwargs)
+                stop_strings = kwargs.pop("until", None)
+                
+                # Extract max_gen_toks if provided, otherwise use default
+                if "max_gen_toks" in kwargs.keys() and "max_new_tokens" in kwargs.keys():
+                    eval_logger.warning("Both max_gen_toks and max_new_tokens specified, using max_new_tokens")
+                max_gen_toks = kwargs.pop("max_gen_toks", self.max_gen_toks)
+
+                if "max_new_tokens" in kwargs.keys():
+                    max_gen_toks = kwargs.pop("max_new_tokens")
+            else:
+                raise ValueError(f"Expected kwargs to be of type dict but got {type(gen_kwargs)}")
+            
+            # Create generation config
+            generation_config = ov_genai.GenerationConfig(
+                max_new_tokens=max_gen_toks,
+                stop_strings=set(stop_strings) if stop_strings else set(),
+                do_sample=kwargs.get("do_sample", False),
+                temperature=kwargs.get("temperature", 1.0),
+                top_p=kwargs.get("top_p", 1.0),
+                top_k=kwargs.get("top_k", 50)
+            )
+
+            try:
+                # Use OpenVINO GenAI pipeline for generation
+                result = self._model(context, generation_config)
+                # Extract the generated text from the result
+                generated_text = result.texts[0] if hasattr(result, 'texts') and result.texts else ""
+            except Exception as e:
+                eval_logger.warning(f"Generation failed: {e}, returning empty string")
+                generated_text = ""
+                
+            res.append(generated_text)
+            
+            self.cache_hook.add_partial("generate_until", (context, gen_kwargs), generated_text)
+            
+            pbar.update(1)
+        
+        pbar.close()
+        return res
 
 
