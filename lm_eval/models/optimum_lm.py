@@ -27,11 +27,6 @@ class OptimumLM(HFLM):
         device="cpu",
         **kwargs,
     ) -> None:
-        if "backend" in kwargs:
-            assert kwargs["backend"] in ["causal", "seq2seq"], (
-                "Currently, only OVModelForCausalLM or OVModelForSeq2SeqLM are supported."
-            )
-
         self.openvino_device = device
 
         super().__init__(
