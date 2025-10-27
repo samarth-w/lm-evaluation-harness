@@ -100,24 +100,38 @@ class OpenVINOCausalLM(HFLM):
             )
 
     def _setup_tokenizer_compatibility(self):
-        """Add HuggingFace-compatible attributes to OpenVINO GenAI tokenizer."""
-        # Try to get vocab size from the tokenizer
-        if not hasattr(self.tokenizer, 'vocab_size'):
-            try:
-                # For OpenVINO GenAI tokenizer, we can estimate vocab size
-                # by trying to get the largest token ID
-                self.tokenizer.vocab_size = getattr(self.tokenizer, 'get_vocab_size', lambda: 32000)()
-            except:
-                # Fallback to a reasonable default for most models
-                self.tokenizer.vocab_size = 32000
-                eval_logger.warning("Could not determine vocab size, using default: 32000")
+        """Create a wrapper to provide HuggingFace-compatible interface for OpenVINO GenAI tokenizer."""
+        # Create a wrapper class that adds the missing attributes
+        class TokenizerWrapper:
+            def __init__(self, ov_tokenizer):
+                self._tokenizer = ov_tokenizer
+                
+                # Try to get vocab size
+                try:
+                    self.vocab_size = getattr(ov_tokenizer, 'get_vocab_size', lambda: 32000)()
+                except:
+                    self.vocab_size = 32000
+                    eval_logger.warning("Could not determine vocab size, using default: 32000")
+                
+                # Set token IDs with fallbacks
+                try:
+                    self.pad_token_id = getattr(ov_tokenizer, 'get_pad_token_id', lambda: 0)()
+                except:
+                    self.pad_token_id = 0
+                
+                try:
+                    self.eos_token_id = getattr(ov_tokenizer, 'get_eos_token_id', lambda: 2)()
+                except:
+                    self.eos_token_id = 2
+                
+                try:
+                    self.bos_token_id = getattr(ov_tokenizer, 'get_bos_token_id', lambda: 1)()
+                except:
+                    self.bos_token_id = 1
+            
+            def __getattr__(self, name):
+                # Delegate all other attributes/methods to the original tokenizer
+                return getattr(self._tokenizer, name)
         
-        # Add other compatibility attributes if needed
-        if not hasattr(self.tokenizer, 'pad_token_id'):
-            self.tokenizer.pad_token_id = getattr(self.tokenizer, 'get_pad_token_id', lambda: 0)()
-        
-        if not hasattr(self.tokenizer, 'eos_token_id'):
-            self.tokenizer.eos_token_id = getattr(self.tokenizer, 'get_eos_token_id', lambda: 2)()
-        
-        if not hasattr(self.tokenizer, 'bos_token_id'):
-            self.tokenizer.bos_token_id = getattr(self.tokenizer, 'get_bos_token_id', lambda: 1)()
+        # Replace the tokenizer with our wrapper
+        self.tokenizer = TokenizerWrapper(self.tokenizer)
