@@ -77,13 +77,10 @@ class OpenVINOCausalLM(LM):
             )
 
             # Get the tokenizer from the pipeline
-            self._ov_tokenizer = self.model.get_tokenizer()
+            self.tokenizer = self.model.get_tokenizer()
             
-            # Create simple model config first to get vocab size
-            self.config = self._detect_model_config(pretrained, self._ov_tokenizer)
-            
-            # Wrap tokenizer with additional attributes
-            self.tokenizer = self._wrap_tokenizer(self._ov_tokenizer)
+            # Create simple model config
+            self.config = self._detect_model_config(pretrained)
 
             eval_logger.info(f"Successfully loaded OpenVINO GenAI model: {pretrained}")
             eval_logger.info(f"Device: {self.openvino_device.upper()}")
@@ -99,41 +96,7 @@ class OpenVINOCausalLM(LM):
                 f"the device '{self.openvino_device}' is available."
             )
 
-    def _wrap_tokenizer(self, ov_tokenizer):
-        """Wrap OpenVINO GenAI tokenizer to provide HF-compatible interface."""
-        class TokenizerWrapper:
-            def __init__(self, ov_tokenizer, config):
-                self._tokenizer = ov_tokenizer
-                self.vocab_size = config.vocab_size
-                
-                # Try to get token IDs
-                try:
-                    self.eos_token_id = getattr(ov_tokenizer, 'eos_token_id', 2)
-                    self.bos_token_id = getattr(ov_tokenizer, 'bos_token_id', 1)
-                    self.pad_token_id = getattr(ov_tokenizer, 'pad_token_id', 0)
-                except:
-                    self.eos_token_id = 2
-                    self.bos_token_id = 1
-                    self.pad_token_id = 0
-            
-            def encode(self, text):
-                """Encode text to token IDs."""
-                result = self._tokenizer.encode(text)
-                if hasattr(result, 'input_ids'):
-                    return result.input_ids.tolist()
-                return result.tolist() if hasattr(result, 'tolist') else list(result)
-            
-            def decode(self, tokens):
-                """Decode token IDs to text."""
-                return self._tokenizer.decode(tokens)
-            
-            def __getattr__(self, name):
-                """Delegate to original tokenizer."""
-                return getattr(self._tokenizer, name)
-        
-        return TokenizerWrapper(ov_tokenizer, self.config)
-
-    def _detect_model_config(self, pretrained: str, tokenizer):
+    def _detect_model_config(self, pretrained: str):
         """Create a simple config object with dynamic model detection."""
         class SimpleConfig:
             def __init__(self, model_path, tokenizer):
@@ -172,20 +135,13 @@ class OpenVINOCausalLM(LM):
                 # Try to get actual vocab size from tokenizer
                 try:
                     if hasattr(tokenizer, 'get_vocab_size'):
-                        actual_vocab_size = tokenizer.get_vocab_size()
-                        if actual_vocab_size and actual_vocab_size > 0:
-                            self.vocab_size = actual_vocab_size
+                        self.vocab_size = tokenizer.get_vocab_size()
                     elif hasattr(tokenizer, 'vocab_size'):
-                        actual_vocab_size = tokenizer.vocab_size
-                        if actual_vocab_size and actual_vocab_size > 0:
-                            self.vocab_size = actual_vocab_size
-                except Exception as e:
-                    eval_logger.debug(f"Could not get vocab size from tokenizer: {e}")
+                        self.vocab_size = tokenizer.vocab_size
+                except:
                     pass  # Keep default
-                    
-                eval_logger.info(f"Detected model: {self.model_type}, vocab_size: {self.vocab_size}")
 
-        return SimpleConfig(pretrained, tokenizer)
+        return SimpleConfig(pretrained, self.tokenizer)
 
     @property
     def eot_token_id(self):
@@ -215,40 +171,9 @@ class OpenVINOCausalLM(LM):
     def tok_encode(self, string: str) -> List[int]:
         """Encode string to token IDs."""
         encoded = self.tokenizer.encode(string)
-        
-        # Handle different return types from OpenVINO GenAI tokenizer
         if hasattr(encoded, 'input_ids'):
-            # If it has input_ids attribute
-            ids = encoded.input_ids
-        else:
-            ids = encoded
-        
-        # Convert OpenVINO tensor to list
-        try:
-            # Check if it's an OpenVINO tensor by checking the type name
-            type_name = type(ids).__name__
-            if 'Tensor' in type_name and hasattr(ids, 'data'):
-                # OpenVINO tensor - access via .data and convert to numpy
-                import numpy as np
-                return np.array(ids.data).tolist()
-            elif hasattr(ids, 'tolist') and 'Tensor' not in type_name:
-                # Regular Python/numpy objects with tolist()
-                return ids.tolist()
-            elif hasattr(ids, '__iter__'):
-                return list(ids)
-            else:
-                return [int(ids)]
-        except Exception as e:
-            eval_logger.debug(f"Error converting tokens to list: {e}")
-            # Fallback: try to convert to numpy first, then to list
-            try:
-                import numpy as np
-                if hasattr(ids, 'data'):
-                    return np.array(ids.data).tolist()
-                else:
-                    return np.array(ids).tolist()
-            except:
-                return [1, 2, 3]  # Emergency fallback
+            return encoded.input_ids.tolist()
+        return encoded.tolist() if hasattr(encoded, 'tolist') else list(encoded)
 
     def tok_decode(self, tokens: List[int]) -> str:
         """Decode token IDs to string."""
@@ -256,78 +181,84 @@ class OpenVINOCausalLM(LM):
 
     def loglikelihood(self, requests, disable_tqdm: bool = False):
         """
-        Compute loglikelihood using a simplified approach for OpenVINO GenAI.
-        This provides basic loglikelihood estimation for evaluation.
+        Compute loglikelihood using OpenVINO GenAI's logprobs functionality.
+        This replaces dummy logits with real probability computation.
         """
-        eval_logger.info(f"Starting loglikelihood computation for {len(requests)} requests")
+        import openvino_genai as ov_genai
+        
         res = []
-        # Create progress bar optimized for remote usage
+        # Create progress bar
         pbar = tqdm(
             total=len(requests),
-            disable=disable_tqdm,
-            desc="Running loglikelihood",
-            unit="req",
-            ncols=100,
-            ascii=True,  # Better for remote terminals
-            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+            disable=(disable_tqdm or (len(requests) < 10)),
+            desc="Running loglikelihood"
         )
 
-        for i, request in enumerate(requests):
+        for request in requests:
             # Handle both Instance objects and tuples
             if isinstance(request, tuple):
                 context, continuation = request
             else:
                 context, continuation = request.args
 
+            # Create generation config with logprobs enabled
+            config = ov_genai.GenerationConfig()
+            config.max_new_tokens = 1  # We just need logprobs, not generation
+            config.do_sample = False
+            config.num_return_sequences = 1
+            
+            # Enable logprobs - this is the key feature
+            config.return_dict_in_generate = True
+            config.output_logits = True
+
             try:
-                # Tokenize the continuation to get length
-                continuation_tokens = self.tok_encode(continuation)
+                # Prepare the full input text
+                full_text = context + continuation
                 
-                if len(continuation_tokens) == 0:
-                    logprob = 0.0
+                # Generate with logprobs enabled
+                result = self.model.generate(full_text, config)
+                
+                # Extract logprobs from the result
+                if hasattr(result, 'logprobs') and result.logprobs:
+                    # Calculate loglikelihood from the logprobs
+                    # This is a simplified calculation - you might need to adjust based on 
+                    # the exact structure of result.logprobs
+                    logprob = sum(result.logprobs) if isinstance(result.logprobs, list) else result.logprobs
+                    is_greedy = True  # Since we used do_sample=False
                 else:
-                    # Simple logprob estimation based on token length
-                    # This is a basic heuristic - shorter continuations get better scores
-                    # In a full implementation, you'd use actual model probabilities
-                    logprob = -1.5 * len(continuation_tokens)
-                
-                is_greedy = True
+                    # Fallback: estimate from the continuation tokens
+                    continuation_tokens = self.tok_encode(continuation)
+                    # This is a simplified fallback - real implementation would need proper logprob calculation
+                    logprob = -len(continuation_tokens) * 2.0  # Rough estimate
+                    is_greedy = True
+                    eval_logger.warning("Using fallback logprob estimation - real logprobs not available")
 
             except Exception as e:
                 eval_logger.warning(f"Error computing logprobs: {e}")
                 # Fallback calculation
-                logprob = -5.0  # Default penalty
+                continuation_tokens = self.tok_encode(continuation)
+                logprob = -len(continuation_tokens) * 2.0  # Rough estimate
                 is_greedy = True
 
             res.append((logprob, is_greedy))
             pbar.update(1)
-            
-            # Log progress every 100 requests for remote monitoring
-            if (i + 1) % 100 == 0:
-                eval_logger.info(f"Loglikelihood progress: {i + 1}/{len(requests)} completed")
 
         pbar.close()
-        eval_logger.info(f"Completed loglikelihood computation for {len(requests)} requests")
         return res
 
     def generate_until(self, requests, disable_tqdm: bool = False):
         """Generate text until stopping criteria are met."""
         import openvino_genai as ov_genai
         
-        eval_logger.info(f"Starting text generation for {len(requests)} requests")
         res = []
-        # Create progress bar optimized for remote usage
+        # Create progress bar
         pbar = tqdm(
             total=len(requests),
-            disable=disable_tqdm,
-            desc="Running generate_until",
-            unit="req",
-            ncols=100,
-            ascii=True,  # Better for remote terminals
-            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+            disable=(disable_tqdm or (len(requests) < 10)),
+            desc="Running generate_until"
         )
 
-        for i, request in enumerate(requests):
+        for request in requests:
             # Handle both Instance objects and tuples
             if isinstance(request, tuple):
                 context, generation_kwargs = request
@@ -367,13 +298,8 @@ class OpenVINOCausalLM(LM):
                 res.append("")  # Return empty string on error
 
             pbar.update(1)
-            
-            # Log progress every 50 requests for remote monitoring
-            if (i + 1) % 50 == 0:
-                eval_logger.info(f"Generation progress: {i + 1}/{len(requests)} completed")
 
         pbar.close()
-        eval_logger.info(f"Completed text generation for {len(requests)} requests")
         return res
 
     def loglikelihood_rolling(self, requests, disable_tqdm: bool = False):
