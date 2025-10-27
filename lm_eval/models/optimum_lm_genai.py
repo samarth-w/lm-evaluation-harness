@@ -128,6 +128,27 @@ class OpenVINOCausalLM(HFLM):
                     self.bos_token_id = getattr(ov_tokenizer, 'get_bos_token_id', lambda: 1)()
                 except:
                     self.bos_token_id = 1
+                
+                # Add token string attributes (not just IDs)
+                try:
+                    self.pad_token = getattr(ov_tokenizer, 'get_pad_token', lambda: None)()
+                except:
+                    self.pad_token = None
+                
+                try:
+                    self.eos_token = getattr(ov_tokenizer, 'get_eos_token', lambda: '</s>')()
+                except:
+                    self.eos_token = '</s>'
+                
+                try:
+                    self.bos_token = getattr(ov_tokenizer, 'get_bos_token', lambda: '<s>')()
+                except:
+                    self.bos_token = '<s>'
+                
+                try:
+                    self.unk_token = getattr(ov_tokenizer, 'get_unk_token', lambda: '<unk>')()
+                except:
+                    self.unk_token = '<unk>'
             
             def __getattr__(self, name):
                 # Delegate all other attributes/methods to the original tokenizer
