@@ -28,12 +28,14 @@ class OpenVINOCausalLM(HFLM):
         convert_tokenizer=False,
         trust_remote_code=True,
         kv_cache=False,
+        cache_dir="",
         **kwargs,
     ) -> None:
         self.openvino_device = device
         self.trust_remote_code = trust_remote_code
         self.convert_tokenizer = convert_tokenizer
         self.kv_cache = kv_cache
+        self.cache_dir = cache_dir
 
         super().__init__(
             device=self.openvino_device,
@@ -63,7 +65,7 @@ class OpenVINOCausalLM(HFLM):
         ov_properties = {
             "PERFORMANCE_HINT": "LATENCY",
             "NUM_STREAMS": "1",
-            "CACHE_DIR": "",
+            "CACHE_DIR": self.cache_dir,  # Use cache_dir for OpenVINO model caching
         }
 
         # Configure KV cache if enabled
@@ -91,6 +93,8 @@ class OpenVINOCausalLM(HFLM):
             eval_logger.info(f"Successfully loaded OpenVINO GenAI model: {pretrained}")
             eval_logger.info(f"Device: {self.openvino_device.upper()}")
             eval_logger.info(f"KV Cache: {'enabled' if self.kv_cache else 'disabled'}")
+            if self.cache_dir:
+                eval_logger.info(f"OpenVINO Cache Directory: {self.cache_dir}")
             
             # Add config attribute for compatibility - store internally
             self._config = self._create_model_config()
