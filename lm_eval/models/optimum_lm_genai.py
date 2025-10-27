@@ -110,12 +110,20 @@ class OpenVINOCausalLM(HFLM):
             def __init__(self, ov_tokenizer):
                 self._tokenizer = ov_tokenizer
                 
-                # Try to get vocab size
+                # Try to get vocab size from OpenVINO GenAI tokenizer
                 try:
-                    self.vocab_size = getattr(ov_tokenizer, 'get_vocab_size', lambda: 32000)()
-                except:
-                    self.vocab_size = 32000
-                    eval_logger.warning("Could not determine vocab size, using default: 32000")
+                    # Try different methods to get vocab size
+                    if hasattr(ov_tokenizer, 'get_vocab_size'):
+                        self.vocab_size = ov_tokenizer.get_vocab_size()
+                    elif hasattr(ov_tokenizer, 'vocab_size'):
+                        self.vocab_size = ov_tokenizer.vocab_size
+                    else:
+                        # For Gemma models, typical vocab size is around 256k
+                        self.vocab_size = 256000
+                        eval_logger.warning(f"Could not determine vocab size from tokenizer, using Gemma default: {self.vocab_size}")
+                except Exception as e:
+                    self.vocab_size = 256000  # Larger default for modern models
+                    eval_logger.warning(f"Error getting vocab size ({e}), using default: {self.vocab_size}")
                 
                 # Set token IDs with fallbacks
                 try:
@@ -225,7 +233,7 @@ class OpenVINOCausalLM(HFLM):
                 self.architectures = ["GemmaForCausalLM"]
                 
                 # Tokenizer info  
-                self.vocab_size = getattr(tokenizer, 'vocab_size', 32000)
+                self.vocab_size = getattr(tokenizer, 'vocab_size', 256000)
                 self.pad_token_id = getattr(tokenizer, 'pad_token_id', 0)
                 self.eos_token_id = getattr(tokenizer, 'eos_token_id', 2)
                 self.bos_token_id = getattr(tokenizer, 'bos_token_id', 1)
@@ -268,7 +276,7 @@ class OpenVINOCausalLM(HFLM):
         # For now, return dummy logits since OpenVINO GenAI is primarily for generation
         # A proper implementation would need access to the model's raw forward pass
         batch_size, seq_len = inps.shape
-        vocab_size = getattr(self.tokenizer, 'vocab_size', 32000)
+        vocab_size = getattr(self.tokenizer, 'vocab_size', 256000)
         
         # Create dummy logits (uniform distribution)
         logits = torch.randn(batch_size, seq_len, vocab_size, dtype=torch.float32)
