@@ -90,6 +90,9 @@ class OpenVINOCausalLM(HFLM):
             eval_logger.info(f"Successfully loaded OpenVINO GenAI model: {pretrained}")
             eval_logger.info(f"Device: {self.openvino_device.upper()}")
             eval_logger.info(f"KV Cache: {'enabled' if self.kv_cache else 'disabled'}")
+            
+            # Add config attribute for compatibility
+            self._add_model_config()
 
         except Exception as e:
             raise RuntimeError(
@@ -205,5 +208,28 @@ class OpenVINOCausalLM(HFLM):
         
         # Replace the tokenizer with our wrapper
         self.tokenizer = TokenizerWrapper(self.tokenizer)
+
+    def _add_model_config(self):
+        """Add a config attribute to the model for compatibility with evaluation harness."""
+        class ModelConfig:
+            def __init__(self):
+                # Common attributes that evaluation harness checks
+                self.max_position_embeddings = 4096  # Default max length
+                self.max_length = 4096
+                self.n_positions = 4096
+                self.max_seq_len = 4096
+                
+                # Model type info
+                self.model_type = "gemma"  # Based on the model path showing gemma
+                self.architectures = ["GemmaForCausalLM"]
+                
+                # Tokenizer info  
+                self.vocab_size = getattr(self.tokenizer, 'vocab_size', 32000)
+                self.pad_token_id = getattr(self.tokenizer, 'pad_token_id', 0)
+                self.eos_token_id = getattr(self.tokenizer, 'eos_token_id', 2)
+                self.bos_token_id = getattr(self.tokenizer, 'bos_token_id', 1)
+        
+        # Add config to the model
+        self._model.config = ModelConfig()
 
 
