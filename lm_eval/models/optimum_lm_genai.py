@@ -415,7 +415,24 @@ class OpenVINOCausalLM(LM):
 
                     # If structured logprobs not available, fallback to heuristics
                     if batch_logits is None and batch_sparse is None:
-                        # No structured logprobs available - create a tiny sparse heuristic map
+                        # Log a short debug summary of the raw result to help troubleshoot
+                        try:
+                            # Avoid dumping huge content; just log type and common attributes
+                            attrs = [a for a in dir(result) if not a.startswith('_')]
+                            sample_attrs = attrs[:40]
+                            info = {a: type(getattr(result, a)).__name__ if hasattr(result, a) else 'N/A' for a in sample_attrs}
+                            eval_logger.debug(f"OpenVINO result summary: type={type(result)}, sample_attrs={info}")
+                            # If result has small fields like 'text' or 'generated_text', log truncated
+                            for small_field in ('generated_text', 'text', 'output_text', 'decoded_text'):
+                                if hasattr(result, small_field):
+                                    try:
+                                        val = getattr(result, small_field)
+                                        s = str(val)
+                                        eval_logger.debug(f"OpenVINO {small_field} (truncated): {s[:300]}")
+                                    except Exception:
+                                        pass
+                        except Exception as _:
+                            pass
                         eval_logger.debug("No structured logprobs in result, falling back to sparse heuristic logits")
                         batch_sparse = []
                         for pos_idx in range(seq_len):
