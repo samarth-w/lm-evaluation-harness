@@ -582,7 +582,29 @@ def evaluate(
                 cloned_reqs.extend([req] * req.repeats)
 
         # run requests through model
-        resps = getattr(lm, reqtype)(cloned_reqs)
+        eval_logger.info(
+            f"Invoking model.{reqtype} with {len(cloned_reqs)} requests on rank {lm.rank}"
+        )
+        import time
+
+        start_ts = time.time()
+        try:
+            resps = getattr(lm, reqtype)(cloned_reqs)
+        except Exception as e:
+            elapsed = time.time() - start_ts
+            eval_logger.exception(
+                f"Model.{reqtype} raised an exception after {elapsed:.2f}s: {e}"
+            )
+            raise
+        elapsed = time.time() - start_ts
+        # Log basic completion info
+        try:
+            n_out = len(resps)
+        except Exception:
+            n_out = None
+        eval_logger.info(
+            f"Completed model.{reqtype} in {elapsed:.2f}s; responses={n_out}"
+        )
 
         # put responses from model into a list of length K for each request.
         for x, req in zip(resps, cloned_reqs):

@@ -892,8 +892,15 @@ class HFLM(TemplateLM):
         truncation: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # encode a batch of strings. converts to tensors and pads automatically, unlike tok_encode.
-        old_padding_side = self.tokenizer.padding_side
-        self.tokenizer.padding_side = padding_side
+        # Some tokenizer implementations (e.g., certain OpenVINO tokenizers)
+        # may not expose `padding_side`. Use getattr/setattr defensively so
+        # we don't raise an AttributeError in that case.
+        old_padding_side = getattr(self.tokenizer, 'padding_side', 'right')
+        try:
+            setattr(self.tokenizer, 'padding_side', padding_side)
+        except Exception:
+            # If we can't set it on the underlying tokenizer, ignore and continue
+            pass
 
         add_special_tokens = {}
         if self.backend == "causal":
@@ -906,6 +913,66 @@ class HFLM(TemplateLM):
             return_tensors="pt",
             **add_special_tokens,
         )
+
+        # Normalize tokenizer outputs: some backends return a dict-like mapping,
+        # others return objects or plain lists. Ensure we always have a dict with
+        # 'input_ids' and 'attention_mask' (tensors when return_tensors=='pt').
+        try:
+            # Case: dict-like -> nothing to do
+            if isinstance(encoding, dict):
+                pass
+            # Case: object with attributes
+            elif hasattr(encoding, 'input_ids'):
+                encoding = {
+                    'input_ids': getattr(encoding, 'input_ids'),
+                    'attention_mask': getattr(encoding, 'attention_mask', None),
+                }
+            # Case: raw list/tuple of token id lists
+            elif isinstance(encoding, (list, tuple)):
+                input_ids = list(encoding)
+                # If this looks like a flat sequence of ints (e.g., [1,2,3]),
+                # wrap it into a batch-of-one: [[1,2,3]]
+                is_flat = False
+                try:
+                    # If all elements are ints (or numpy ints), treat as flat
+                    import numpy as _np
+
+                    is_flat = all(
+                        isinstance(x, (int,)) or (_np is not None and isinstance(x, _np.integer))
+                        for x in input_ids
+                    )
+                except Exception:
+                    is_flat = all(isinstance(x, int) for x in input_ids)
+
+                if is_flat:
+                    input_ids = [input_ids]
+
+                attention_mask = [[1] * len(ids) for ids in input_ids]
+                import torch
+
+                try:
+                    encoding = {
+                        'input_ids': torch.tensor(input_ids, dtype=torch.long),
+                        'attention_mask': torch.tensor(attention_mask, dtype=torch.long),
+                    }
+                except Exception:
+                    encoding = {'input_ids': input_ids, 'attention_mask': attention_mask}
+            else:
+                # Fallback: try to coerce to something list-like
+                try:
+                    input_ids = list(encoding)
+                    attention_mask = [[1] * len(ids) for ids in input_ids]
+                    import torch
+                    encoding = {
+                        'input_ids': torch.tensor(input_ids, dtype=torch.long),
+                        'attention_mask': torch.tensor(attention_mask, dtype=torch.long),
+                    }
+                except Exception:
+                    # As a last resort, wrap the input into a single sequence
+                    encoding = {'input_ids': [[1]], 'attention_mask': [[1]]}
+        except Exception:
+            # If normalization fails, re-raise a clearer error to aid debugging
+            raise RuntimeError(f"Unexpected tokenizer output type: {type(encoding)}")
         if left_truncate_len:
             original_lengths = encoding["input_ids"].size(1)
             if original_lengths > left_truncate_len:
@@ -917,11 +984,36 @@ class HFLM(TemplateLM):
             encoding["attention_mask"] = encoding["attention_mask"][
                 :, -left_truncate_len:
             ]
-        self.tokenizer.padding_side = old_padding_side
+        try:
+            setattr(self.tokenizer, 'padding_side', old_padding_side)
+        except Exception:
+            # Ignore failures to restore padding_side on tokenizers that don't support it
+            pass
 
         return encoding["input_ids"], encoding["attention_mask"]
 
     def tok_decode(self, tokens: Iterator[list[str]], skip_special_tokens: bool = True):
+        """Decode tokens defensively: ensure we never pass a bare int to tokenizer.decode.
+
+        Some backends' tokenizer.decode implementations expect a sequence of ints.
+        Coerce single integers or non-iterables into a list before forwarding.
+        """
+        # If tokens looks like a single integer (e.g., 1), wrap it in a list
+        try:
+            import numpy as _np
+        except Exception:
+            _np = None
+
+        if isinstance(tokens, (int,)) or ( _np is not None and isinstance(tokens, _np.integer) ):
+            tokens = [int(tokens)]
+
+        # If tokens is not a list/sequence, try to coerce
+        if not isinstance(tokens, (list, tuple)):
+            try:
+                tokens = list(tokens)
+            except Exception:
+                tokens = [tokens]
+
         return self.tokenizer.decode(tokens, skip_special_tokens=skip_special_tokens)
 
     def _model_call(
@@ -995,14 +1087,109 @@ class HFLM(TemplateLM):
             dtype=self.mixed_precision_dtype,
             enabled=self.mixed_precision_dtype is not None,
         ):
-            return self.model.generate(
-                input_ids=context,
-                max_length=max_length,
-                stopping_criteria=stopping_criteria,
-                pad_token_id=self.tokenizer.pad_token_id,
-                use_cache=True,
-                **generation_kwargs,
-            )
+            # Try standard HF-style generate first. Some backends (e.g., OpenVINO
+            # LLMPipeline) do not accept HF-style kwargs like `input_ids` or
+            # `stopping_criteria`. If a TypeError occurs, fall back to a
+            # pipeline-compatible call by decoding the context to strings and
+            # passing simpler generation kwargs.
+            try:
+                return self.model.generate(
+                    input_ids=context,
+                    max_length=max_length,
+                    stopping_criteria=stopping_criteria,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    use_cache=True,
+                    **generation_kwargs,
+                )
+            except TypeError:
+                # Fallback for non-HF backends (attempt to call with text inputs)
+                try:
+                    # Convert tensor context to list of token-id lists
+                    ctx_lists = context.tolist()
+                except Exception:
+                    # If we can't convert, re-raise the original error
+                    raise
+
+                import time
+                eval_logger.info("OpenVINO fallback: decoding contexts to text...")
+                t0 = time.time()
+                # Decode each sequence to text using tokenizer.decode (defensive)
+                decoded_inputs = [self.tok_decode(seq, skip_special_tokens=False) for seq in ctx_lists]
+                t1 = time.time()
+                eval_logger.info(f"Decoded {len(decoded_inputs)} contexts in {t1-t0:.2f}s")
+
+                # Build simple kwargs for generation: prefer 'until' if provided via `stop`
+                simple_kwargs = {}
+                # 'stop' is a list of strings passed to _model_generate
+                if stop:
+                    simple_kwargs['until'] = stop
+
+                # Map a few generation options if present
+                for k in ('do_sample', 'temperature'):
+                    if k in generation_kwargs:
+                        simple_kwargs[k] = generation_kwargs[k]
+
+                # max_length remains available
+                simple_kwargs['max_length'] = max_length
+
+                # Before calling the pipeline, ensure max_length is greater than
+                # the prompt token length. Token counts may differ between the
+                # harness' context tensor and tokenizer.decode/encode roundtrips,
+                # so compute prompt lengths and adjust max_length conservatively.
+                try:
+                    # token lengths using our tokenizer wrapper
+                    prompt_lens = [len(self.tok_encode(s)) for s in decoded_inputs]
+                    max_prompt_len = max(prompt_lens) if prompt_lens else 0
+                except Exception:
+                    max_prompt_len = 0
+
+                # Derive max_gen_toks from the provided max_length and context
+                try:
+                    ctx_len = int(context.shape[1])
+                except Exception:
+                    ctx_len = 0
+                max_gen_toks = max(0, int(max_length) - ctx_len)
+
+                if simple_kwargs.get('max_length', None) is None:
+                    simple_kwargs['max_length'] = max_length
+
+                if simple_kwargs['max_length'] <= max_prompt_len:
+                    old_ml = simple_kwargs['max_length']
+                    simple_kwargs['max_length'] = max_prompt_len + max_gen_toks + 1
+                    eval_logger.warning(
+                        f"Adjusted OpenVINO max_length from {old_ml} to {simple_kwargs['max_length']} to exceed prompt length {max_prompt_len}"
+                    )
+
+                # Optional debug cap: if OV_DEBUG_MAXLEN is set in the environment,
+                # force a smaller max_length to make end-to-end runs quicker.
+                try:
+                    import os
+
+                    dbg_ml = os.getenv('OV_DEBUG_MAXLEN')
+                    if dbg_ml is not None:
+                        dbg_ml = int(dbg_ml)
+                        if dbg_ml > 0 and simple_kwargs['max_length'] > dbg_ml:
+                            # Ensure debug cap does not fall below prompt length + 1
+                            min_allowed = max_prompt_len + 1
+                            new_ml = dbg_ml if dbg_ml >= min_allowed else min_allowed
+                            if new_ml != dbg_ml:
+                                eval_logger.warning(
+                                    f"OV_DEBUG_MAXLEN ({dbg_ml}) is below prompt length ({max_prompt_len}); raising cap to {new_ml}"
+                                )
+                            else:
+                                eval_logger.warning(
+                                    f"OV_DEBUG_MAXLEN is set; capping OpenVINO max_length {simple_kwargs['max_length']} -> {dbg_ml}"
+                                )
+                            simple_kwargs['max_length'] = new_ml
+                except Exception:
+                    pass
+
+                eval_logger.info(f"Calling OpenVINO pipeline.generate with simple_kwargs={simple_kwargs}")
+                t2 = time.time()
+                res = self.model.generate(decoded_inputs, **simple_kwargs)
+                t3 = time.time()
+                eval_logger.info(f"OpenVINO pipeline.generate returned in {t3-t2:.2f}s")
+                return res
 
     def _select_cont_toks(
         self,
