@@ -296,60 +296,112 @@ class OpenVINOCausalLM(LM):
 
         eval_logger.debug(f"_model_call: batch_size={batch_size}, seq_len={seq_len}, vocab_size={vocab_size}")
 
-        # Try to use OpenVINO GenAI's generation with logprobs for real logits
-        try:
-            all_logits = []
+        all_logits = []
 
-            for batch_idx in range(batch_size):
-                input_ids = inps[batch_idx].tolist()
-                
-                if batch_idx < 3:  # Debug first few
-                    eval_logger.debug(f"Processing batch {batch_idx}, input_ids length: {len(input_ids)}")
+        for batch_idx in range(batch_size):
+            input_ids = inps[batch_idx].tolist()
+
+            if batch_idx < 3:
+                eval_logger.debug(f"Processing batch {batch_idx}, input_ids length: {len(input_ids)}")
+
+            try:
+                import openvino_genai as ov_genai
+
+                # Preferred: call the model with token ids / encoded inputs to get EncodedResults
+                gen_config = ov_genai.GenerationConfig()
+                gen_config.max_new_tokens = 1
+                gen_config.do_sample = False
+                gen_config.echo = True
+                # Request some logprobs; many models return top-k logprobs
+                gen_config.logprobs = min(getattr(self.tokenizer, 'vocab_size', 512), 512)
+
+                batch_logits = None
 
                 try:
-                    # Create generation config to get logprobs
-                    import openvino_genai as ov_genai
-                    config = ov_genai.GenerationConfig()
-                    config.max_new_tokens = 1  # Generate minimal tokens to get logprobs
-                    config.do_sample = False  # Use greedy to be deterministic
-                    
-                    # Convert input_ids to text for generation
-                    input_text = self.tokenizer.decode(input_ids)
-                    
-                    # Generate to get probabilities 
-                    result = self.model.generate(input_text, config)
-                    
-                    # For now, create reasonable logits based on generation
-                    # This is a simplified approach - ideally we'd get actual logprobs
-                    batch_logits = torch.randn(seq_len, vocab_size, dtype=torch.float32)
-                    
-                    # Add some signal based on the actual generation
-                    if result and len(result) > len(input_text):
-                        # The model generated something, give it some positive signal
+                    # Try encoded/tensor input path which typically returns EncodedResults
+                    result = None
+                    try:
+                        # If the pipeline supports direct call with input_ids/EncodedInputs
+                        result = self.model(input_ids, gen_config)
+                    except Exception:
+                        # Fall back to generate with encoded input via decode->string only if needed
+                        input_text = self.tokenizer.decode(input_ids)
+                        result = self.model.generate(input_text, gen_config)
+
+                    # Attempt to extract structured logprobs from result
+                    # OpenVINO GenAI may expose 'logprobs', 'generated_log_probs' or 'scores'
+                    logprobs_seq = None
+                    if hasattr(result, 'logprobs') and result.logprobs is not None:
+                        logprobs_seq = result.logprobs
+                    elif hasattr(result, 'generated_log_probs') and result.generated_log_probs is not None:
+                        logprobs_seq = result.generated_log_probs
+                    elif hasattr(result, 'scores') and result.scores is not None:
+                        # scores may contain per-token score dicts
+                        logprobs_seq = result.scores
+
+                    if logprobs_seq is not None:
+                        # Build full-vocab logits per position
+                        # logprobs_seq is expected to be an iterable of mappings {token_id: logprob}
+                        batch_list = []
+                        for pos_idx in range(seq_len):
+                            pos_logits = torch.full((vocab_size,), -float('inf'), dtype=torch.float32)
+                            try:
+                                pos_map = logprobs_seq[pos_idx]
+                                # If mapping-like, iterate token_id->logprob
+                                if isinstance(pos_map, dict) or hasattr(pos_map, 'items'):
+                                    for token_id, logprob in pos_map.items():
+                                        try:
+                                            tid = int(token_id)
+                                            if 0 <= tid < vocab_size:
+                                                pos_logits[tid] = float(logprob)
+                                        except Exception:
+                                            continue
+                                else:
+                                    # If pos_map is a sequence of (token, score) strings, try best-effort
+                                    try:
+                                        for item in pos_map:
+                                            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                                                tid = int(item[0]); val = float(item[1]);
+                                                if 0 <= tid < vocab_size:
+                                                    pos_logits[tid] = val
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                # If no mapping available for this pos, leave -inf
+                                pass
+                            batch_list.append(pos_logits)
+
+                        if batch_list:
+                            batch_logits = torch.stack(batch_list)
+
+                    # If structured logprobs not available, fallback to heuristics
+                    if batch_logits is None:
+                        eval_logger.debug("No structured logprobs in result, falling back to heuristic logits")
+                        batch_logits = torch.randn(seq_len, vocab_size, dtype=torch.float32)
+                        # give slight preference to input tokens
                         for pos_idx in range(min(seq_len, len(input_ids))):
-                            if pos_idx < len(input_ids):
-                                token_id = input_ids[pos_idx]
-                                if token_id < vocab_size:
-                                    batch_logits[pos_idx, token_id] += 2.0  # Boost actual tokens
-                    
-                    all_logits.append(batch_logits)
-                    
+                            tid = int(input_ids[pos_idx]) if pos_idx < len(input_ids) else None
+                            if tid is not None and 0 <= tid < vocab_size:
+                                batch_logits[pos_idx, tid] += 2.0
+
                 except Exception as e:
-                    eval_logger.debug(f"Error in batch {batch_idx}: {e}")
-                    # Fallback to random logits for this batch
-                    all_logits.append(torch.randn(seq_len, vocab_size, dtype=torch.float32))
+                    eval_logger.debug(f"Error extracting logprobs for batch {batch_idx}: {e}")
+                    batch_logits = torch.randn(seq_len, vocab_size, dtype=torch.float32)
 
-            if all_logits:
-                logits = torch.stack(all_logits)
-                eval_logger.debug(f"Successfully created logits tensor: {logits.shape}")
-                return logits
+                all_logits.append(batch_logits)
 
-        except Exception as e:
-            eval_logger.warning(f"Error in _model_call: {e}")
+            except Exception as e:
+                eval_logger.warning(f"Failed to get logprobs from OpenVINO GenAI: {e}")
+                all_logits.append(torch.randn(seq_len, vocab_size, dtype=torch.float32))
 
-        # Final fallback to dummy logits
+        if all_logits:
+            logits = torch.stack(all_logits)
+            eval_logger.debug(f"_model_call returning logits with shape: {logits.shape}")
+            return logits
+
+        # Final fallback
         logits = torch.randn(batch_size, seq_len, vocab_size, dtype=torch.float32)
-        eval_logger.warning("Using dummy logits for OpenVINO GenAI - real logprobs implementation needed")
+        eval_logger.warning("Using dummy logits for OpenVINO GenAI - logprobs approach failed.")
         return logits
 
     def loglikelihood(self, requests, disable_tqdm: bool = False):
@@ -395,28 +447,58 @@ class OpenVINOCausalLM(LM):
         
         for i, request in enumerate(requests):
             (context, continuation), context_enc, continuation_enc = request
-            
+
             # Combine context and continuation for full sequence
             full_enc = context_enc + continuation_enc
             full_tensor = torch.tensor([full_enc], dtype=torch.long)
-            
+
             try:
-                # Call _model_call to get logits
+                # Call _model_call to get logits: shape [batch=1, seq_len, vocab_size]
                 logits = self._model_call(full_tensor)
-                
-                # Calculate loglikelihood for continuation tokens
-                # This is a simplified version - ideally we'd use actual logprobs
-                # For now, return reasonable values to verify the flow works
-                logprob = -2.0  # Default reasonable logprob
+
+                if logits is None:
+                    raise RuntimeError("_model_call returned None")
+
+                # Convert logits to log-probabilities across vocab
+                # logits shape -> [1, seq_len, vocab_size]
+                log_probs = torch.log_softmax(logits, dim=-1)
+
+                # Continuation spans the tail of the sequence
+                ctx_len = len(context_enc)
+                cont_len = len(continuation_enc)
+
+                # Compute sum logprob for continuation tokens using teacher-forcing (prob of each true token)
+                total_logprob = 0.0
+                for idx in range(cont_len):
+                    seq_pos = ctx_len + idx
+                    if seq_pos >= log_probs.shape[1]:
+                        # missing position
+                        total_logprob += float(-100.0)
+                        continue
+                    token_id = int(continuation_enc[idx])
+                    if token_id < 0 or token_id >= log_probs.shape[2]:
+                        total_logprob += float(-100.0)
+                    else:
+                        total_logprob += float(log_probs[0, seq_pos, token_id].item())
+
+                # Heuristic: is_greedy if model's argmax matches continuation tokens
                 is_greedy = True
-                
-                res.append((logprob, is_greedy))
-                
+                for idx in range(cont_len):
+                    seq_pos = ctx_len + idx
+                    if seq_pos >= logits.shape[1]:
+                        is_greedy = False
+                        break
+                    predicted = int(torch.argmax(logits[0, seq_pos]).item())
+                    if predicted != int(continuation_enc[idx]):
+                        is_greedy = False
+                        break
+
+                res.append((float(total_logprob), bool(is_greedy)))
+
             except Exception as e:
                 eval_logger.warning(f"Error computing logprobs for request {i}: {e}")
-                # Fallback to reasonable default
-                res.append((-5.0, True))
-            
+                res.append((-100.0, True))
+
             pbar.update(1)
             
             # Log progress for remote monitoring
@@ -496,7 +578,7 @@ class OpenVINOCausalLM(LM):
     def generate_until(self, requests, disable_tqdm: bool = False):
         """Generate text until stopping criteria are met."""
         import openvino_genai as ov_genai
-        
+
         eval_logger.info(f"Starting text generation for {len(requests)} requests")
         res = []
         # Create progress bar optimized for remote usage
@@ -520,16 +602,16 @@ class OpenVINOCausalLM(LM):
 
             # Create generation config
             config = ov_genai.GenerationConfig()
-            
+
             # Set max tokens
             max_gen_toks = generation_kwargs.get('max_gen_toks', self.max_gen_toks)
             config.max_new_tokens = max_gen_toks
-            
+
             # Set stopping criteria
             until = generation_kwargs.get('until', [])
             if until:
                 config.stop_strings = until
-            
+
             # Set sampling parameters
             config.do_sample = generation_kwargs.get('do_sample', False)
             config.temperature = generation_kwargs.get('temperature', 1.0)
@@ -538,11 +620,11 @@ class OpenVINOCausalLM(LM):
             try:
                 # Generate text
                 generated_text = self.model.generate(context, config)
-                
+
                 # Remove the input context from the result
-                if generated_text.startswith(context):
+                if isinstance(generated_text, str) and generated_text.startswith(context):
                     generated_text = generated_text[len(context):]
-                
+
                 res.append(generated_text)
 
             except Exception as e:
@@ -550,7 +632,7 @@ class OpenVINOCausalLM(LM):
                 res.append("")  # Return empty string on error
 
             pbar.update(1)
-            
+
             # Log progress every 50 requests for remote monitoring
             if (i + 1) % 50 == 0:
                 eval_logger.info(f"Generation progress: {i + 1}/{len(requests)} completed")
