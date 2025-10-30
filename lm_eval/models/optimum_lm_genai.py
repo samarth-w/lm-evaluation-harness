@@ -593,25 +593,89 @@ class OpenVINOCausalLM(LM):
                     else:
                         # batch_entry should be a list of dicts per position
                         batch_sparse = batch_entry
-                        for idx in range(cont_len):
-                            seq_pos = ctx_len + idx
-                            if seq_pos >= len(batch_sparse):
-                                total_logprob += float(-100.0)
+
+                        # Heuristic detection: if sparse maps contain only positive heuristic scores
+                        # (we add +2.0 for input tokens), treat as fallback and try sequence scoring.
+                        try:
+                            flat_vals = [v for pos in batch_sparse for v in (pos.values() if pos else [])]
+                            has_real_negatives = any((isinstance(v, (int, float)) and v <= 0) for v in flat_vals)
+                        except Exception:
+                            has_real_negatives = False
+
+                        if not has_real_negatives:
+                            # Fallback: try to obtain sequence-level scores and subtract context score
+                            try:
+                                import openvino_genai as ov_genai
+
+                                gen_cfg = ov_genai.GenerationConfig()
+                                gen_cfg.max_new_tokens = 1
+                                gen_cfg.do_sample = False
+                                gen_cfg.echo = True
+                                # we don't require per-token logprobs here
+                                gen_cfg.logprobs = 0
+
+                                # Full sequence scoring
+                                try:
+                                    full_result = self.model(full_enc, gen_cfg)
+                                except Exception:
+                                    # try string fallback
+                                    full_text = self.tok_decode(full_enc)
+                                    full_result = self.model.generate(full_text, gen_cfg)
+
+                                # Context scoring
+                                try:
+                                    ctx_result = self.model(context_enc, gen_cfg)
+                                except Exception:
+                                    ctx_text = self.tok_decode(context_enc)
+                                    ctx_result = self.model.generate(ctx_text, gen_cfg)
+
+                                # Extract numeric scores if possible
+                                def extract_score(res):
+                                    try:
+                                        if hasattr(res, 'scores') and res.scores is not None:
+                                            s = res.scores
+                                            if isinstance(s, (list, tuple)) and len(s) == 1:
+                                                return float(s[0])
+                                            if isinstance(s, (int, float)):
+                                                return float(s)
+                                    except Exception:
+                                        pass
+                                    return None
+
+                                full_score = extract_score(full_result)
+                                ctx_score = extract_score(ctx_result)
+
+                                if full_score is not None and ctx_score is not None:
+                                    total_logprob = float(full_score - ctx_score)
+                                    is_greedy = False
+                                else:
+                                    # cannot extract sequence scores - penalize
+                                    total_logprob = float(-100.0)
+                                    is_greedy = False
+                            except Exception:
+                                total_logprob = float(-100.0)
                                 is_greedy = False
-                                continue
-                            pos_map = batch_sparse[seq_pos] or {}
-                            token_id = int(continuation_enc[idx])
-                            if token_id in pos_map:
-                                total_logprob += float(pos_map[token_id])
-                                # greedy if argmax in pos_map equals token_id
-                                if pos_map:
-                                    predicted = max(pos_map.items(), key=lambda kv: kv[1])[0]
-                                    if int(predicted) != token_id:
-                                        is_greedy = False
-                            else:
-                                # Missing token in sparse map; penalize
-                                total_logprob += float(-100.0)
-                                is_greedy = False
+                        else:
+                            # Use sparse per-position maps directly
+                            for idx in range(cont_len):
+                                seq_pos = ctx_len + idx
+                                if seq_pos >= len(batch_sparse):
+                                    total_logprob += float(-100.0)
+                                    is_greedy = False
+                                    continue
+                                pos_map = batch_sparse[seq_pos] or {}
+                                token_id = int(continuation_enc[idx])
+                                if token_id in pos_map:
+                                    total_logprob += float(pos_map[token_id])
+                                    # greedy if argmax in pos_map equals token_id
+                                    if pos_map:
+                                        predicted = max(pos_map.items(), key=lambda kv: kv[1])[0]
+                                        if int(predicted) != token_id:
+                                            is_greedy = False
+                                else:
+                                    # Missing token in sparse map; penalize
+                                    total_logprob += float(-100.0)
+                                    is_greedy = False
 
                 res.append((float(total_logprob), bool(is_greedy)))
 
