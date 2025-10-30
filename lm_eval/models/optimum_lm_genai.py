@@ -119,9 +119,42 @@ class OpenVINOCausalLM(LM):
             def encode(self, text):
                 """Encode text to token IDs."""
                 result = self._tokenizer.encode(text)
+
+                # Normalize to a raw ids object
                 if hasattr(result, 'input_ids'):
-                    return result.input_ids.tolist()
-                return result.tolist() if hasattr(result, 'tolist') else list(result)
+                    ids = result.input_ids
+                else:
+                    ids = result
+
+                # Handle OpenVINO Tensor (.data), numpy, and other iterable types
+                try:
+                    # OpenVINO tensor exposes .data
+                    if hasattr(ids, 'data'):
+                        data = ids.data
+                        # If data is numpy-like
+                        try:
+                            return data.flatten().tolist()
+                        except Exception:
+                            import numpy as _np
+                            return _np.array(data).flatten().tolist()
+                    # numpy array or torch tensor with .tolist
+                    if hasattr(ids, 'tolist'):
+                        return ids.tolist()
+                    # torch tensor with .numpy
+                    if hasattr(ids, 'numpy'):
+                        return ids.numpy().tolist()
+                    # Fallback: iterable
+                    if hasattr(ids, '__iter__') and not isinstance(ids, (str, bytes)):
+                        return list(ids)
+                    # Single numeric value
+                    return [int(ids)]
+                except Exception:
+                    # Last-resort conversion
+                    try:
+                        import numpy as _np
+                        return _np.array(ids).flatten().tolist()
+                    except Exception:
+                        return [int(ids)]
             
             def decode(self, tokens):
                 """Decode token IDs to text."""
