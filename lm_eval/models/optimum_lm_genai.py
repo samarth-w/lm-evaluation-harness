@@ -329,6 +329,9 @@ class OpenVINOCausalLM(LM):
 
         eval_logger.debug(f"_model_call: batch_size={batch_size}, seq_len={seq_len}, vocab_size={vocab_size}")
 
+        # all_logits will be a list with one entry per batch. Each entry
+        # will be either a torch.Tensor of shape [seq_len, vocab_size]
+        # or a list-of-dicts where each dict maps token_id->logprob for that position.
         all_logits = []
 
         for batch_idx in range(batch_size):
@@ -349,6 +352,7 @@ class OpenVINOCausalLM(LM):
                 gen_config.logprobs = min(getattr(self.tokenizer, 'vocab_size', 512), 512)
 
                 batch_logits = None
+                batch_sparse = None
 
                 try:
                     # Try encoded/tensor input path which typically returns EncodedResults
@@ -373,64 +377,83 @@ class OpenVINOCausalLM(LM):
                         logprobs_seq = result.scores
 
                     if logprobs_seq is not None:
-                        # Build full-vocab logits per position
-                        # logprobs_seq is expected to be an iterable of mappings {token_id: logprob}
-                        batch_list = []
+                        # Prefer to keep a sparse representation: a list of dicts mapping token_id->logprob
+                        # This avoids allocating huge dense tensors for very large vocabs (e.g. 256k)
+                        batch_sparse = []
                         for pos_idx in range(seq_len):
-                            pos_logits = torch.full((vocab_size,), -float('inf'), dtype=torch.float32)
+                            pos_map_out = {}
                             try:
                                 pos_map = logprobs_seq[pos_idx]
-                                # If mapping-like, iterate token_id->logprob
                                 if isinstance(pos_map, dict) or hasattr(pos_map, 'items'):
                                     for token_id, logprob in pos_map.items():
                                         try:
                                             tid = int(token_id)
                                             if 0 <= tid < vocab_size:
-                                                pos_logits[tid] = float(logprob)
+                                                pos_map_out[tid] = float(logprob)
                                         except Exception:
                                             continue
                                 else:
-                                    # If pos_map is a sequence of (token, score) strings, try best-effort
+                                    # Handle sequences like [(token, score), ...]
                                     try:
                                         for item in pos_map:
                                             if isinstance(item, (list, tuple)) and len(item) >= 2:
-                                                tid = int(item[0]); val = float(item[1]);
+                                                tid = int(item[0]); val = float(item[1])
                                                 if 0 <= tid < vocab_size:
-                                                    pos_logits[tid] = val
+                                                    pos_map_out[tid] = val
                                     except Exception:
                                         pass
                             except Exception:
-                                # If no mapping available for this pos, leave -inf
                                 pass
-                            batch_list.append(pos_logits)
+                            batch_sparse.append(pos_map_out)
 
-                        if batch_list:
-                            batch_logits = torch.stack(batch_list)
+                        if any(batch_sparse):
+                            # If we have any non-empty position maps, use sparse representation
+                            batch_logits = None
+                        else:
+                            # If sparse maps are all empty, fall back to heuristic dense logits
+                            batch_sparse = None
 
                     # If structured logprobs not available, fallback to heuristics
-                    if batch_logits is None:
-                        eval_logger.debug("No structured logprobs in result, falling back to heuristic logits")
-                        batch_logits = torch.randn(seq_len, vocab_size, dtype=torch.float32)
-                        # give slight preference to input tokens
-                        for pos_idx in range(min(seq_len, len(input_ids))):
-                            tid = int(input_ids[pos_idx]) if pos_idx < len(input_ids) else None
-                            if tid is not None and 0 <= tid < vocab_size:
-                                batch_logits[pos_idx, tid] += 2.0
+                    if batch_logits is None and batch_sparse is None:
+                        # No structured logprobs available - create a tiny sparse heuristic map
+                        eval_logger.debug("No structured logprobs in result, falling back to sparse heuristic logits")
+                        batch_sparse = []
+                        for pos_idx in range(seq_len):
+                            pos_map_out = {}
+                            # give slight preference to input tokens only
+                            if pos_idx < len(input_ids):
+                                try:
+                                    tid = int(input_ids[pos_idx])
+                                    if 0 <= tid < vocab_size:
+                                        pos_map_out[tid] = 2.0
+                                except Exception:
+                                    pass
+                            batch_sparse.append(pos_map_out)
 
                 except Exception as e:
                     eval_logger.debug(f"Error extracting logprobs for batch {batch_idx}: {e}")
                     batch_logits = torch.randn(seq_len, vocab_size, dtype=torch.float32)
 
-                all_logits.append(batch_logits)
+                # Prefer returning sparse mapping when available (list of dicts)
+                if batch_sparse is not None:
+                    all_logits.append(batch_sparse)
+                else:
+                    all_logits.append(batch_logits)
 
             except Exception as e:
                 eval_logger.warning(f"Failed to get logprobs from OpenVINO GenAI: {e}")
                 all_logits.append(torch.randn(seq_len, vocab_size, dtype=torch.float32))
 
         if all_logits:
-            logits = torch.stack(all_logits)
-            eval_logger.debug(f"_model_call returning logits with shape: {logits.shape}")
-            return logits
+            # If the entries are dense tensors, stack and return tensor
+            if isinstance(all_logits[0], torch.Tensor):
+                logits = torch.stack(all_logits)
+                eval_logger.debug(f"_model_call returning dense logits with shape: {logits.shape}")
+                return logits
+            else:
+                # Return sparse representation: list (batch) of list (seq_len) of dict(token_id->logprob)
+                eval_logger.debug("_model_call returning sparse per-position logprob mappings")
+                return all_logits
 
         # Final fallback
         logits = torch.randn(batch_size, seq_len, vocab_size, dtype=torch.float32)
@@ -492,39 +515,86 @@ class OpenVINOCausalLM(LM):
                 if logits is None:
                     raise RuntimeError("_model_call returned None")
 
-                # Convert logits to log-probabilities across vocab
-                # logits shape -> [1, seq_len, vocab_size]
-                log_probs = torch.log_softmax(logits, dim=-1)
-
-                # Continuation spans the tail of the sequence
+                # The model may return either a dense tensor or a sparse mapping.
+                # If dense tensor: compute as before. If sparse (list of per-pos dicts), use that directly.
                 ctx_len = len(context_enc)
                 cont_len = len(continuation_enc)
 
-                # Compute sum logprob for continuation tokens using teacher-forcing (prob of each true token)
                 total_logprob = 0.0
-                for idx in range(cont_len):
-                    seq_pos = ctx_len + idx
-                    if seq_pos >= log_probs.shape[1]:
-                        # missing position
-                        total_logprob += float(-100.0)
-                        continue
-                    token_id = int(continuation_enc[idx])
-                    if token_id < 0 or token_id >= log_probs.shape[2]:
-                        total_logprob += float(-100.0)
-                    else:
-                        total_logprob += float(log_probs[0, seq_pos, token_id].item())
-
-                # Heuristic: is_greedy if model's argmax matches continuation tokens
                 is_greedy = True
-                for idx in range(cont_len):
-                    seq_pos = ctx_len + idx
-                    if seq_pos >= logits.shape[1]:
-                        is_greedy = False
-                        break
-                    predicted = int(torch.argmax(logits[0, seq_pos]).item())
-                    if predicted != int(continuation_enc[idx]):
-                        is_greedy = False
-                        break
+
+                # Dense tensor path
+                if isinstance(logits, torch.Tensor):
+                    # logits shape -> [1, seq_len, vocab_size]
+                    log_probs = torch.log_softmax(logits, dim=-1)
+                    for idx in range(cont_len):
+                        seq_pos = ctx_len + idx
+                        if seq_pos >= log_probs.shape[1]:
+                            total_logprob += float(-100.0)
+                            is_greedy = False
+                            continue
+                        token_id = int(continuation_enc[idx])
+                        if token_id < 0 or token_id >= log_probs.shape[2]:
+                            total_logprob += float(-100.0)
+                            is_greedy = False
+                        else:
+                            total_logprob += float(log_probs[0, seq_pos, token_id].item())
+
+                    # Greedy check
+                    for idx in range(cont_len):
+                        seq_pos = ctx_len + idx
+                        if seq_pos >= logits.shape[1]:
+                            is_greedy = False
+                            break
+                        predicted = int(torch.argmax(logits[0, seq_pos]).item())
+                        if predicted != int(continuation_enc[idx]):
+                            is_greedy = False
+                            break
+
+                else:
+                    # Expecting sparse representation: list (batch) -> for batch=1, take first
+                    try:
+                        batch_entry = logits[0]
+                    except Exception:
+                        batch_entry = logits
+
+                    # If the batch entry is a dense tensor-like, handle it
+                    if isinstance(batch_entry, torch.Tensor):
+                        log_probs = torch.log_softmax(batch_entry.unsqueeze(0), dim=-1)
+                        for idx in range(cont_len):
+                            seq_pos = ctx_len + idx
+                            if seq_pos >= log_probs.shape[1]:
+                                total_logprob += float(-100.0)
+                                is_greedy = False
+                                continue
+                            token_id = int(continuation_enc[idx])
+                            if token_id < 0 or token_id >= log_probs.shape[2]:
+                                total_logprob += float(-100.0)
+                                is_greedy = False
+                            else:
+                                total_logprob += float(log_probs[0, seq_pos, token_id].item())
+                    else:
+                        # batch_entry should be a list of dicts per position
+                        batch_sparse = batch_entry
+                        for idx in range(cont_len):
+                            seq_pos = ctx_len + idx
+                            if seq_pos >= len(batch_sparse):
+                                total_logprob += float(-100.0)
+                                is_greedy = False
+                                continue
+                            pos_map = batch_sparse[seq_pos] or {}
+                            token_id = int(continuation_enc[idx])
+                            if token_id in pos_map:
+                                total_logprob += float(pos_map[token_id])
+                                # greedy if argmax in pos_map equals token_id
+                                if pos_map:
+                                    predicted = max(pos_map.items(), key=lambda kv: kv[1])[0]
+                                    if int(predicted) != token_id:
+                                        is_greedy = False
+                            else:
+                                # Missing token in sparse map; penalize
+                                total_logprob += float(-100.0)
+                                is_greedy = False
 
                 res.append((float(total_logprob), bool(is_greedy)))
 
