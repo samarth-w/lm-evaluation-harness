@@ -15,6 +15,7 @@ from . import (
     optimum_ipex,
     optimum_lm,
     optimum_lm_genai,
+    optimum_lm_genai_combined,
     sglang_causallms,
     sglang_generate_API,
     textsynth,

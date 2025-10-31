@@ -35,9 +35,23 @@ def get_model(model_name):
     try:
         return MODEL_REGISTRY[model_name]
     except KeyError:
-        raise ValueError(
-            f"Attempted to load model '{model_name}', but no model for this name found! Supported model names: {', '.join(MODEL_REGISTRY.keys())}"
-        )
+        # Attempt to auto-import all model modules so decorators run and populate MODEL_REGISTRY.
+        try:
+            # Local import to avoid a hard dependency at module import time
+            import importlib
+
+            importlib.import_module("lm_eval.models")
+        except Exception:
+            # If importing model subpackage fails, continue to raise the original error below
+            pass
+
+        # Re-check registry after attempting import
+        try:
+            return MODEL_REGISTRY[model_name]
+        except KeyError:
+            raise ValueError(
+                f"Attempted to load model '{model_name}', but no model for this name found! Supported model names: {', '.join(MODEL_REGISTRY.keys())}"
+            )
 
 
 TASK_REGISTRY = {}
